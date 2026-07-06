@@ -2231,7 +2231,6 @@ elif page == "📨 对客RFI":
         # 如果session_state中有草稿，恢复它
         if 'rfi_draft_saved' in st.session_state:
             st.info("💡 已恢复之前保存的草稿")
->>>>>>> d7c4f47af53509218248228209e081227241dc49
 =======
 import streamlit as st
 import pandas as pd
