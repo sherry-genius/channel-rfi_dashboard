@@ -1,7 +1,6 @@
-<<<<<<< HEAD
 streamlit
 pandas
 openpyxl
 altair
 matplotlib
-supabase-py
+supabase>=2.0.0
