@@ -7,7 +7,7 @@ import re
 import urllib.request
 from st_supabase_connection import SupabaseConnection
 
-# ========== 币种选项 ==========
+# 币种选项
 CURRENCY_OPTIONS = [
     "USD", "ARS", "AUD", "BHD", "BWP", "BRL", "GBP", "BND", "BGN", "CAD",
     "CLP", "CNY", "COP", "CZK", "DKK", "AED", "EUR", "HKD", "HUF", "ISK",
@@ -17,17 +17,17 @@ CURRENCY_OPTIONS = [
     "TTD", "TRY", "VES", "VND", "CNH", "MTR",
 ]
 
-# ========== 调单分类选项 ==========
+# 调单分类选项 
 STAT_TYPE_OPTIONS = ["Recall", "Personal Information", "Retrieval Request"]
 CONTENT_CATEGORIES = ["", "KYC问询", "单笔交易问询", "账户调查", "结汇", "警方协查", "Recall"]
 TRANSACTION_TYPE_OPTIONS = ["入账", "出款"]
 TRANSACTION_STATUS_OPTIONS = ["已到账", "未到账", "渠道退款", "商户退款"]
 
-# ========== 页面配置 ==========
+# 页面配置 
 st.set_page_config(page_title="调单管理系统", layout="wide")
 st.title("📋 调单管理系统")
 st.warning("✅ 测试版本 v1.0.0 - 2026-07-06")
-# ========== 初始化 Supabase 连接 ==========
+#  初始化 Supabase 连接 
 from supabase import create_client
 
 # 从 secrets 读取配置
@@ -35,7 +35,7 @@ SUPABASE_URL = st.secrets["connections"]["supabase"]["SUPABASE_URL"]
 SUPABASE_KEY = st.secrets["connections"]["supabase"]["SUPABASE_KEY"]
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# ========== 数据读取 ==========
+#  数据读取 
 @st.cache_data(ttl=60)
 def load_all_data():
     try:
@@ -143,7 +143,7 @@ def find_transaction_history(商户ID, 汇款方, 收款方):
             })
     return pd.DataFrame(matches)
 
-# ========== 汇率（x-rates.com） ==========
+#  汇率（x-rates.com） 
 XRATES_URL = "https://www.x-rates.com/table/?from=USD&amount=1"
 XRATES_NAME_TO_CODE = {
     "Argentine Peso": "ARS",
@@ -278,7 +278,7 @@ def normalize_date_range(date_range, fallback_start, fallback_end):
         start, end = end, start
     return start, end
 
-# ========== 模板数据（保持原样，省略以节省空间） ==========
+#  模板数据（保持原样，省略以节省空间） 
 # 由于模板数据非常长，这里保留你原有的 CHANNEL_TEMPLATES 和 INTERNAL_RFI_TEMPLATES
 # 请从你原来的 app.py 中复制这两个字典替换此处
 
@@ -288,9 +288,9 @@ page = st.sidebar.radio(
     ["📊 调单看板", "📝 登记调单", "📤 导入历史数据", "📄 查看全部数据", "📧 回复渠道调单", "📨 对客RFI"]
 )
 
-# ============================================================
+# 
 # PAGE 1: 调单看板
-# ============================================================
+# 
 if page == "📊 调单看板":
     df = load_all_data()
 
@@ -811,7 +811,6 @@ elif page == "📧 回复渠道调单":
 elif page == "📨 对客RFI":
     st.header("📨 对客RFI")
     st.info("该模块模板功能开发中，可参考 Workbook 文档配置对客 RFI 模板。")
-=======
 import streamlit as st
 import pandas as pd
 import sqlite3
