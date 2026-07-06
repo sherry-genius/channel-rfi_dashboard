@@ -4,4 +4,4 @@ pandas
 openpyxl
 altair
 matplotlib
-supabase
+supabase-py
