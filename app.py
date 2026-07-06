@@ -34,7 +34,8 @@ conn = st.connection("supabase", type=SupabaseConnection)
 @st.cache_data(ttl=60)
 def load_all_data():
     try:
-        result = conn.query("*", table="diaodan", ttl="60s")
+        # 使用 Supabase 客户端的 table().select() 方法
+        result = conn.table("diaodan").select("*").execute()
         df = pd.DataFrame(result.data)
         if len(df) == 0:
             return pd.DataFrame()
