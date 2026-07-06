@@ -1,6 +1,7 @@
+<<<<<<< HEAD
 streamlit
 pandas
 openpyxl
 altair
 matplotlib
-st-supabase-connection
+supabase
