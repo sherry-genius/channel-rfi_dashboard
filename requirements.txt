@@ -3,4 +3,5 @@ pandas
 openpyxl
 altair
 matplotlib
-supabase>=2.0.0
+supabase
+st-supabase-connection
