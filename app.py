@@ -40,7 +40,7 @@ supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 def load_all_data():
     try:
         # 使用 Supabase 客户端的 table().select() 方法
-        result = conn.table("diaodan").select("*").execute()
+        result = supabase.table("diaodan").select("*").execute()
         df = pd.DataFrame(result.data)
         if len(df) == 0:
             return pd.DataFrame()
