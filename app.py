@@ -492,25 +492,31 @@ elif page == "📤 导入历史数据":
                     auto_map['商户ID'] = col
                 elif '商户名称' in col_lower or '商户名' in col_lower:
                     auto_map['商户名称'] = col
-                elif '调单类型' in col_lower or '类型' in col_lower:
+                elif '调单类型' in col_lower:
                     auto_map['调单类型'] = col
-                elif '收件日期' in col_lower or '调单日期' in col_lower or '日期' in col_lower:
+                elif '年月' in col and '收件日期' in col:
                     auto_map['收件日期'] = col
-                elif '金额' in col_lower:
+                elif '调单单笔金额' in col or ('单笔' in col and '金额' in col):
                     auto_map['金额'] = col
-                elif '币种' in col_lower:
+                elif '邮件名称' in col or 'reference id' in col_lower:
+                    auto_map['邮件标题'] = col
+                elif '收件日期' in col or '调单日期' in col:
+                    auto_map['收件日期'] = col
+                elif '金额' in col:
+                    auto_map['金额'] = col
+                elif '币种' in col:
                     auto_map['币种'] = col
-                elif '业务线' in col_lower:
+                elif '业务线' in col:
                     auto_map['业务线'] = col
-                elif '渠道' in col_lower:
+                elif '渠道' in col:
                     auto_map['渠道'] = col
-                elif '邮件标题' in col_lower or '邮件名称' in col_lower:
+                elif '邮件标题' in col:
                     auto_map['邮件标题'] = col
             col_map = {}
             col_names = ["商户ID", "商户名称", "调单类型", "收件日期", "金额", "币种", "业务线", "渠道", "邮件标题"]
             col_help = {
-                "商户ID": "必填，如：5181241025033620258",
-                "商户名称": "必填，如：宇信數碼有限公司",
+                "商户ID": "选填，如：5181241025033620258",
+                "商户名称": "选填，如：宇信數碼有限公司",
                 "调单类型": "必填，如：Recall / Personal Information / Retrieval Request",
                 "收件日期": "选填，日期格式",
                 "金额": "选填，数字",
@@ -527,16 +533,16 @@ elif page == "📤 导入历史数据":
                 selected = st.selectbox(f"**{col_name}** - {col_help[col_name]}", options, index=default_index)
                 if selected != "（跳过此列）":
                     col_map[col_name] = selected
-            required_cols = ['商户ID', '商户名称', '调单类型']
+            required_cols = ['调单类型']
             missing = [c for c in required_cols if c not in col_map]
             if missing:
                 st.error(f"⚠️ 请为以下必填列选择对应的Excel列：{missing}")
             else:
-                rename_dict = {v: k for k, v in col_map.items()}
-                df_import = df_import.rename(columns=rename_dict)
-                keep_cols = list(col_map.values())
-                df_import = df_import[keep_cols]
-                for col in ['收件日期', '金额', '币种', '业务线', '渠道', '邮件标题']:
+                df_std = pd.DataFrame()
+                for std_col, excel_col in col_map.items():
+                    df_std[std_col] = df_import[excel_col].values
+                df_import = df_std
+                for col in col_names:
                     if col not in df_import.columns:
                         df_import[col] = None
                 df_import['收件日期'] = pd.to_datetime(df_import['收件日期'], errors='coerce').dt.strftime('%Y-%m-%d')
@@ -555,7 +561,10 @@ elif page == "📤 导入历史数据":
                     except (ValueError, TypeError):
                         return 0
                 df_import['金额'] = df_import['金额'].apply(clean_amount)
-                df_import = df_import.fillna({'金额': 0, '币种': 'USD', '业务线': '其他', '渠道': '', '邮件标题': ''})
+                df_import = df_import.fillna({
+                    '商户ID': '', '商户名称': '', '金额': 0, '币种': 'USD',
+                    '业务线': '其他', '渠道': '', '邮件标题': '',
+                })
                 st.success(f"✅ 列名映射完成！共 {len(df_import)} 行数据准备导入")
                 st.dataframe(df_import.head(10), use_container_width=True)
                 if st.button("🚀 开始导入", type="primary"):
@@ -564,15 +573,17 @@ elif page == "📤 导入历史数据":
                     success_count = 0
                     skip_count = 0
                     for _, row in df_import.iterrows():
-                        key = (str(row['商户ID']), str(row['收件日期']), str(row['调单类型']))
+                        merchant_id = str(row.get('商户ID', '') or '')
+                        merchant_name = str(row.get('商户名称', '') or '')
+                        key = (merchant_id, str(row['收件日期']), str(row['调单类型']))
                         if key in existing_keys:
                             skip_count += 1
                             continue
                         try:
                             data = {
                                 "收件日期": str(row['收件日期']),
-                                "商户ID": str(row['商户ID']),
-                                "商户名称": str(row['商户名称']),
+                                "商户ID": merchant_id,
+                                "商户名称": merchant_name,
                                 "调单类型": str(row['调单类型']),
                                 "金额": float(row['金额']) if pd.notna(row['金额']) else 0,
                                 "币种": str(row['币种']),
