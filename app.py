@@ -78,6 +78,72 @@ def save_data(收件日期, 商户ID, 商户名称, 调单类型, 金额, 币种
         st.error(f"保存数据失败：{e}")
         return False
 
+def clean_import_str(value, default=""):
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return default
+    text = str(value).strip()
+    if text.lower() in ("nan", "none", "nat"):
+        return default
+    return text
+
+def format_import_date(value):
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return ""
+    dt = pd.to_datetime(value, errors="coerce")
+    if pd.isna(dt):
+        return ""
+    return dt.strftime("%Y-%m-%d")
+
+def clean_import_amount(value):
+    if value is None or value == "" or (isinstance(value, float) and pd.isna(value)):
+        return 0
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        value = value.replace(",", "")
+        parts = value.split(".")
+        if len(parts) > 2:
+            value = "".join(parts[:-1]) + "." + parts[-1]
+    try:
+        return float(value)
+    except (ValueError, TypeError):
+        return 0
+
+def prepare_import_dataframe(df_raw, col_map, col_names):
+    df_std = pd.DataFrame()
+    for std_col, excel_col in col_map.items():
+        df_std[std_col] = df_raw[excel_col].values
+    for col in col_names:
+        if col not in df_std.columns:
+            df_std[col] = None
+    df_std["收件日期"] = df_std["收件日期"].apply(format_import_date)
+    df_std["金额"] = df_std["金额"].apply(clean_import_amount)
+    df_std = df_std.fillna({
+        "商户ID": "", "商户名称": "", "金额": 0, "币种": "USD",
+        "业务线": "其他", "渠道": "", "邮件标题": "",
+    })
+    for col in ["商户ID", "商户名称", "调单类型", "币种", "业务线", "渠道", "邮件标题"]:
+        df_std[col] = df_std[col].apply(clean_import_str)
+    return df_std
+
+def row_to_import_record(row):
+    merchant_id = clean_import_str(row.get("商户ID")) or "未填写"
+    merchant_name = clean_import_str(row.get("商户名称")) or "未填写"
+    return {
+        "收件日期": clean_import_str(row.get("收件日期")),
+        "商户ID": merchant_id,
+        "商户名称": merchant_name,
+        "调单类型": clean_import_str(row.get("调单类型")),
+        "金额": float(row["金额"]) if pd.notna(row.get("金额")) else 0,
+        "币种": clean_import_str(row.get("币种"), "USD"),
+        "业务线": clean_import_str(row.get("业务线"), "其他"),
+        "渠道": clean_import_str(row.get("渠道")),
+        "邮件标题": clean_import_str(row.get("邮件标题")),
+        "调单内容分类": "",
+        "调单内容详情": "",
+        "登记时间": datetime.datetime.now().isoformat(),
+    }
+
 def delete_data(id):
     try:
         supabase.table("diaodan").delete().eq("id", id).execute()
@@ -530,7 +596,12 @@ elif page == "📤 导入历史数据":
                 if col_name in auto_map and auto_map[col_name] in all_cols:
                     default_index = all_cols.index(auto_map[col_name]) + 1
                 options = ["（跳过此列）"] + all_cols
-                selected = st.selectbox(f"**{col_name}** - {col_help[col_name]}", options, index=default_index)
+                selected = st.selectbox(
+                    f"**{col_name}** - {col_help[col_name]}",
+                    options,
+                    index=default_index,
+                    key=f"import_map_{col_name}",
+                )
                 if selected != "（跳过此列）":
                     col_map[col_name] = selected
             required_cols = ['调单类型']
@@ -538,69 +609,60 @@ elif page == "📤 导入历史数据":
             if missing:
                 st.error(f"⚠️ 请为以下必填列选择对应的Excel列：{missing}")
             else:
-                df_std = pd.DataFrame()
-                for std_col, excel_col in col_map.items():
-                    df_std[std_col] = df_import[excel_col].values
-                df_import = df_std
-                for col in col_names:
-                    if col not in df_import.columns:
-                        df_import[col] = None
-                df_import['收件日期'] = pd.to_datetime(df_import['收件日期'], errors='coerce').dt.strftime('%Y-%m-%d')
-                def clean_amount(value):
-                    if value is None or value == '' or pd.isna(value):
-                        return 0
-                    if isinstance(value, (int, float)):
-                        return float(value)
-                    if isinstance(value, str):
-                        value = value.replace(',', '')
-                        parts = value.split('.')
-                        if len(parts) > 2:
-                            value = ''.join(parts[:-1]) + '.' + parts[-1]
-                    try:
-                        return float(value)
-                    except (ValueError, TypeError):
-                        return 0
-                df_import['金额'] = df_import['金额'].apply(clean_amount)
-                df_import = df_import.fillna({
-                    '商户ID': '', '商户名称': '', '金额': 0, '币种': 'USD',
-                    '业务线': '其他', '渠道': '', '邮件标题': '',
-                })
+                df_import = prepare_import_dataframe(df_import, col_map, col_names)
+                st.session_state["import_prepared_df"] = df_import
                 st.success(f"✅ 列名映射完成！共 {len(df_import)} 行数据准备导入")
                 st.dataframe(df_import.head(10), use_container_width=True)
-                if st.button("🚀 开始导入", type="primary"):
-                    existing_df = load_all_data()
-                    existing_keys = set(zip(existing_df['商户ID'], existing_df['收件日期'], existing_df['调单类型'])) if len(existing_df) > 0 else set()
-                    success_count = 0
-                    skip_count = 0
-                    for _, row in df_import.iterrows():
-                        merchant_id = str(row.get('商户ID', '') or '')
-                        merchant_name = str(row.get('商户名称', '') or '')
-                        key = (merchant_id, str(row['收件日期']), str(row['调单类型']))
-                        if key in existing_keys:
-                            skip_count += 1
-                            continue
-                        try:
-                            data = {
-                                "收件日期": str(row['收件日期']),
-                                "商户ID": merchant_id,
-                                "商户名称": merchant_name,
-                                "调单类型": str(row['调单类型']),
-                                "金额": float(row['金额']) if pd.notna(row['金额']) else 0,
-                                "币种": str(row['币种']),
-                                "业务线": str(row['业务线']),
-                                "渠道": str(row['渠道']),
-                                "邮件标题": str(row['邮件标题']),
-                                "调单内容分类": "",
-                                "调单内容详情": "",
-                                "登记时间": datetime.datetime.now().isoformat()
-                            }
-                            supabase.table("diaodan").insert(data).execute()
-                            success_count += 1
-                        except Exception as e:
-                            continue
-                    st.cache_data.clear()
-                    st.success(f"✅ 导入完成！成功导入 {success_count} 条，跳过重复 {skip_count} 条")
-                    st.balloons()
+                if st.button("🚀 开始导入", type="primary", key="import_start_btn"):
+                    df_to_import = st.session_state.get("import_prepared_df")
+                    if df_to_import is None or len(df_to_import) == 0:
+                        st.error("❌ 没有可导入的数据，请重新上传文件并确认列映射")
+                    else:
+                        existing_df = load_all_data()
+                        existing_keys = set()
+                        if len(existing_df) > 0:
+                            for _, existing_row in existing_df.iterrows():
+                                existing_keys.add((
+                                    clean_import_str(existing_row.get("商户ID")) or "未填写",
+                                    clean_import_str(existing_row.get("收件日期")),
+                                    clean_import_str(existing_row.get("调单类型")),
+                                ))
+                        success_count = 0
+                        skip_count = 0
+                        fail_count = 0
+                        empty_type_count = 0
+                        error_samples = []
+                        for row_idx, row in df_to_import.iterrows():
+                            order_type = clean_import_str(row.get("调单类型")) or clean_import_str(row.get("业务线"))
+                            if not order_type:
+                                empty_type_count += 1
+                                continue
+                            record = row_to_import_record(row)
+                            record["调单类型"] = order_type
+                            key = (record["商户ID"], record["收件日期"], record["调单类型"])
+                            if key in existing_keys:
+                                skip_count += 1
+                                continue
+                            try:
+                                supabase.table("diaodan").insert(record).execute()
+                                success_count += 1
+                                existing_keys.add(key)
+                            except Exception as e:
+                                fail_count += 1
+                                if len(error_samples) < 5:
+                                    error_samples.append(f"第 {row_idx + 2} 行：{e}")
+                        st.cache_data.clear()
+                        if success_count > 0:
+                            st.success(f"✅ 导入完成！成功导入 {success_count} 条，跳过重复 {skip_count} 条")
+                            st.balloons()
+                        else:
+                            st.warning(f"⚠️ 导入完成，但未写入任何数据。成功 {success_count} 条，跳过重复 {skip_count} 条，失败 {fail_count} 条，调单类型为空 {empty_type_count} 条")
+                        if empty_type_count > 0:
+                            st.info(f"有 {empty_type_count} 行因「调单类型」为空被跳过，请检查 Excel 映射是否正确。")
+                        if error_samples:
+                            st.error("以下行写入数据库失败：")
+                            for msg in error_samples:
+                                st.write(f"- {msg}")
         except Exception as e:
             st.error(f"❌ 读取文件失败：{e}")
             st.write("详细错误：", e)
