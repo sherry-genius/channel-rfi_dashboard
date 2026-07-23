@@ -618,6 +618,14 @@ def delete_data(id):
         st.error(f"删除失败：{e}")
         return False
 
+def delete_all_data():
+    try:
+        supabase.table("diaodan").delete().gte("id", 0).execute()
+        st.cache_data.clear()
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
 def save_edited_records(edited_df):
     if len(edited_df) == 0:
         return 0
@@ -1190,64 +1198,86 @@ elif page == "📤 导入历史数据":
 elif page == "📄 查看全部数据":
     st.header("📄 全部调单数据")
     df = load_all_data()
-    if len(df) == 0:
-        st.info("暂无数据")
-        st.stop()
-    st.write(f"共 **{len(df)}** 条记录")
-    st.info("💡 可直接在下方表格中修改数据，修改完成后点击「保存修改」写入数据库")
-    type_options = sorted(set(STAT_TYPE_OPTIONS) | set(df['调单类型'].dropna().astype(str)))
-    biz_options = sorted(set(["电商", "B2B", "服贸汇兑", "其他"]) | set(df['业务线'].dropna().astype(str)))
-    content_options = sorted(set([c for c in CONTENT_CATEGORIES if c]) | set(df['调单内容分类'].dropna().astype(str)))
-    currency_options = sorted(set(CURRENCY_OPTIONS) | set(df['币种'].dropna().astype(str)))
-    display_df = df.copy()
-    display_df['金额'] = pd.to_numeric(display_df['金额'], errors='coerce').fillna(0)
-    edited_df = st.data_editor(
-        display_df,
-        use_container_width=True,
-        height=500,
-        num_rows="fixed",
-        disabled=["id", "登记时间"],
-        column_config={
-            "id": st.column_config.NumberColumn("ID", disabled=True),
-            "收件日期": st.column_config.TextColumn("收件日期"),
-            "商户ID": st.column_config.TextColumn("商户ID"),
-            "商户名称": st.column_config.TextColumn("商户名称"),
-            "调单类型": st.column_config.SelectboxColumn("调单类型", options=type_options),
-            "金额": st.column_config.NumberColumn("金额", format="%.2f"),
-            "币种": st.column_config.SelectboxColumn("币种", options=currency_options),
-            "业务线": st.column_config.SelectboxColumn("业务线", options=biz_options),
-            "渠道": st.column_config.TextColumn("渠道"),
-            "邮件标题": st.column_config.TextColumn("邮件标题"),
-            "调单内容分类": st.column_config.SelectboxColumn("调单内容分类", options=[""] + content_options),
-            "调单内容详情": st.column_config.TextColumn("调单内容详情", width="large"),
-            "登记时间": st.column_config.TextColumn("登记时间", disabled=True),
-        },
-        key="all_data_editor",
-    )
-    btn_col1, btn_col2, btn_col3 = st.columns([1, 1, 2])
-    with btn_col1:
-        if st.button("💾 保存修改", type="primary"):
-            if len(edited_df) == 0:
-                st.info("没有数据可保存")
-            else:
-                updated = save_edited_records(edited_df)
-                if updated > 0:
-                    st.success(f"✅ 已更新 {updated} 条记录")
+    tab_data, tab_clear = st.tabs(["📋 数据列表", "🗑️ 清空数据"])
+
+    with tab_data:
+        if len(df) == 0:
+            st.info("暂无数据")
+        else:
+            st.write(f"共 **{len(df)}** 条记录")
+            st.info("💡 可直接在下方表格中修改数据，修改完成后点击「保存修改」写入数据库")
+            type_options = sorted(set(STAT_TYPE_OPTIONS) | set(df['调单类型'].dropna().astype(str)))
+            biz_options = sorted(set(["电商", "B2B", "服贸汇兑", "其他"]) | set(df['业务线'].dropna().astype(str)))
+            content_options = sorted(set([c for c in CONTENT_CATEGORIES if c]) | set(df['调单内容分类'].dropna().astype(str)))
+            currency_options = sorted(set(CURRENCY_OPTIONS) | set(df['币种'].dropna().astype(str)))
+            display_df = df.copy()
+            display_df['金额'] = pd.to_numeric(display_df['金额'], errors='coerce').fillna(0)
+            edited_df = st.data_editor(
+                display_df,
+                use_container_width=True,
+                height=500,
+                num_rows="fixed",
+                disabled=["id", "登记时间"],
+                column_config={
+                    "id": st.column_config.NumberColumn("ID", disabled=True),
+                    "收件日期": st.column_config.TextColumn("收件日期"),
+                    "商户ID": st.column_config.TextColumn("商户ID"),
+                    "商户名称": st.column_config.TextColumn("商户名称"),
+                    "调单类型": st.column_config.SelectboxColumn("调单类型", options=type_options),
+                    "金额": st.column_config.NumberColumn("金额", format="%.2f"),
+                    "币种": st.column_config.SelectboxColumn("币种", options=currency_options),
+                    "业务线": st.column_config.SelectboxColumn("业务线", options=biz_options),
+                    "渠道": st.column_config.TextColumn("渠道"),
+                    "邮件标题": st.column_config.TextColumn("邮件标题"),
+                    "调单内容分类": st.column_config.SelectboxColumn("调单内容分类", options=[""] + content_options),
+                    "调单内容详情": st.column_config.TextColumn("调单内容详情", width="large"),
+                    "登记时间": st.column_config.TextColumn("登记时间", disabled=True),
+                },
+                key="all_data_editor",
+            )
+            btn_col1, btn_col2 = st.columns([1, 1])
+            with btn_col1:
+                if st.button("💾 保存修改", type="primary"):
+                    if len(edited_df) == 0:
+                        st.info("没有数据可保存")
+                    else:
+                        updated = save_edited_records(edited_df)
+                        if updated > 0:
+                            st.success(f"✅ 已更新 {updated} 条记录")
+                            st.rerun()
+                        else:
+                            st.info("没有检测到变更")
+            with btn_col2:
+                csv = edited_df.to_csv(index=False).encode('utf-8-sig')
+                st.download_button("📥 导出为CSV", csv, "调单数据.csv", "text/csv")
+            st.markdown("---")
+            st.subheader("删除单条记录")
+            col1, col2 = st.columns([1, 3])
+            with col1:
+                delete_id = st.number_input("输入要删除的ID", min_value=1, step=1)
+                if st.button("删除所选ID"):
+                    if delete_data(delete_id):
+                        st.success(f"已删除ID {delete_id}")
+                        st.rerun()
+
+    with tab_clear:
+        st.write(f"当前数据库共有 **{len(df)}** 条记录")
+        if len(df) == 0:
+            st.info("暂无数据可清空")
+        else:
+            st.error("⚠️ 危险操作：将永久删除全部调单记录，不可恢复！")
+            st.markdown("建议清空前先到「数据列表」Tab 导出 CSV 备份。")
+            confirm_clear = st.checkbox("我已了解风险，确认清空全部数据", key="confirm_clear_all")
+            confirm_text = st.text_input("请输入「清空全部」以确认", placeholder="清空全部", key="confirm_clear_text")
+            can_clear = confirm_clear and confirm_text.strip() == "清空全部"
+            if st.button("🗑️ 一键清空全部数据", type="primary", disabled=not can_clear):
+                ok, err = delete_all_data()
+                if ok:
+                    st.success("✅ 已清空全部数据")
                     st.rerun()
                 else:
-                    st.info("没有检测到变更")
-    with btn_col2:
-        csv = edited_df.to_csv(index=False).encode('utf-8-sig')
-        st.download_button("📥 导出为CSV", csv, "调单数据.csv", "text/csv")
-    st.markdown("---")
-    st.subheader("🗑️ 删除记录")
-    col1, col2 = st.columns([1, 3])
-    with col1:
-        delete_id = st.number_input("输入要删除的ID", min_value=1, step=1)
-        if st.button("删除"):
-            if delete_data(delete_id):
-                st.success(f"已删除ID {delete_id}")
-                st.rerun()
+                    st.error(f"❌ 清空失败：{err}")
+                    show_db_error_help([err] if err else [])
 
 # ============================================================
 # PAGE 5: 回复渠道调单
