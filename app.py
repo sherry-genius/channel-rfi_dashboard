@@ -5,6 +5,8 @@ import json
 import os
 import re
 import io
+import zipfile
+import xml.etree.ElementTree as ET
 import urllib.request
 import urllib.parse
 from supabase import create_client
@@ -28,7 +30,7 @@ TRANSACTION_STATUS_OPTIONS = ["已到账", "未到账", "渠道退款", "商户�
 # ========== 页面配置 ==========
 st.set_page_config(page_title="调单管理系统", layout="wide")
 st.title("📋 调单管理系统")
-st.warning("✅ 测试版本 v1.0.9 - 2026-07-23（Excel导入修复）")
+st.warning("✅ 测试版本 v1.0.10 - 2026-07-23（Excel XML 读取）")
 
 # ========== 初始化 Supabase 连接 ==========
 try:
@@ -348,52 +350,166 @@ def _excel_file_bytes(file_obj):
     file_obj.seek(0)
     return file_obj.getvalue()
 
+XLSX_MAIN_NS = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+XLSX_REL_NS = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
+
+def _xlsx_col_to_index(col_letters):
+    idx = 0
+    for ch in col_letters:
+        idx = idx * 26 + (ord(ch.upper()) - ord("A") + 1)
+    return idx - 1
+
+def _xlsx_parse_cell_ref(ref):
+    col = "".join(ch for ch in ref if ch.isalpha())
+    row = "".join(ch for ch in ref if ch.isdigit())
+    return int(row) - 1, _xlsx_col_to_index(col)
+
+def _xlsx_read_shared_strings(zf):
+    path = "xl/sharedStrings.xml"
+    if path not in zf.namelist():
+        return []
+    root = ET.fromstring(zf.read(path))
+    shared_strings = []
+    for si in root.findall(f"{XLSX_MAIN_NS}si"):
+        text_parts = []
+        t = si.find(f"{XLSX_MAIN_NS}t")
+        if t is not None:
+            text_parts.append(t.text or "")
+        else:
+            for node in si.findall(f".//{XLSX_MAIN_NS}t"):
+                text_parts.append(node.text or "")
+        shared_strings.append("".join(text_parts))
+    return shared_strings
+
+def _xlsx_get_sheet_paths(file_bytes):
+    with zipfile.ZipFile(io.BytesIO(file_bytes)) as zf:
+        if "xl/workbook.xml" not in zf.namelist():
+            raise ValueError("不是有效的 xlsx 文件")
+        wb_root = ET.fromstring(zf.read("xl/workbook.xml"))
+        rels_root = ET.fromstring(zf.read("xl/_rels/workbook.xml.rels"))
+        rel_map = {}
+        for rel in rels_root:
+            if rel.tag.endswith("Relationship"):
+                rel_map[rel.attrib["Id"]] = rel.attrib["Target"]
+        sheets = []
+        for sheet in wb_root.findall(f"{XLSX_MAIN_NS}sheets/{XLSX_MAIN_NS}sheet"):
+            rid = sheet.attrib.get(XLSX_REL_NS + "id") or sheet.attrib.get("r:id")
+            target = rel_map[rid]
+            if not target.startswith("xl/"):
+                target = "xl/" + target.lstrip("/")
+            sheets.append({"name": sheet.attrib["name"], "path": target.replace("\\", "/")})
+        return sheets
+
+def _xlsx_read_sheet_xml(file_bytes, sheet_name):
+    with zipfile.ZipFile(io.BytesIO(file_bytes)) as zf:
+        sheets = _xlsx_get_sheet_paths(file_bytes)
+        sheet_info = next((s for s in sheets if s["name"] == sheet_name), None)
+        if sheet_info is None:
+            raise ValueError(f"找不到工作表：{sheet_name}")
+        shared_strings = _xlsx_read_shared_strings(zf)
+        sheet_root = ET.fromstring(zf.read(sheet_info["path"]))
+        rows_data = {}
+        max_row = 0
+        max_col = 0
+        for row in sheet_root.findall(f".//{XLSX_MAIN_NS}sheetData/{XLSX_MAIN_NS}row"):
+            for cell in row.findall(f"{XLSX_MAIN_NS}c"):
+                ref = cell.attrib.get("r")
+                if not ref:
+                    continue
+                row_idx, col_idx = _xlsx_parse_cell_ref(ref)
+                max_row = max(max_row, row_idx)
+                max_col = max(max_col, col_idx)
+                cell_type = cell.attrib.get("t")
+                value = None
+                v = cell.find(f"{XLSX_MAIN_NS}v")
+                if cell_type == "s" and v is not None and v.text is not None:
+                    idx = int(v.text)
+                    value = shared_strings[idx] if idx < len(shared_strings) else v.text
+                elif cell_type == "inlineStr":
+                    t = cell.find(f".//{XLSX_MAIN_NS}t")
+                    value = t.text if t is not None else ""
+                elif v is not None:
+                    value = v.text
+                rows_data.setdefault(row_idx, {})[col_idx] = value
+        table = []
+        for r in range(max_row + 1):
+            row_vals = [rows_data.get(r, {}).get(c) for c in range(max_col + 1)]
+            table.append(row_vals)
+        if not table:
+            return pd.DataFrame()
+        header = table[0]
+        data_rows = table[1:] if len(table) > 1 else []
+        columns = [str(h).strip() if h is not None else f"列{i + 1}" for i, h in enumerate(header)]
+        return pd.DataFrame(data_rows, columns=columns)
+
+def _calamine_available():
+    try:
+        import calamine  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
 def get_excel_sheet_names(file_obj):
     file_bytes = _excel_file_bytes(file_obj)
     filename = getattr(file_obj, "name", "upload.xlsx").lower()
-    attempts = []
-    if filename.endswith(".xls") and not filename.endswith(".xlsx"):
-        attempts.append(("xlrd", {}))
-    attempts.extend([
-        ("calamine", {}),
-        ("openpyxl", {"read_only": True, "data_only": True}),
-        ("openpyxl", {}),
-    ])
     errors = []
-    for engine, engine_kwargs in attempts:
+    if filename.endswith(".xls") and not filename.endswith(".xlsx"):
         try:
             buffer = io.BytesIO(file_bytes)
-            if engine_kwargs:
-                excel_file = pd.ExcelFile(buffer, engine=engine, engine_kwargs=engine_kwargs)
-            else:
-                excel_file = pd.ExcelFile(buffer, engine=engine)
-            return excel_file.sheet_names, engine
+            excel_file = pd.ExcelFile(buffer, engine="xlrd")
+            return excel_file.sheet_names, "xlrd"
         except Exception as exc:
-            errors.append(f"{engine}: {exc}")
+            errors.append(f"xlrd: {exc}")
+    if _calamine_available():
+        try:
+            buffer = io.BytesIO(file_bytes)
+            excel_file = pd.ExcelFile(buffer, engine="calamine")
+            return excel_file.sheet_names, "calamine"
+        except Exception as exc:
+            errors.append(f"calamine: {exc}")
+    for engine_kwargs in ({"read_only": True, "data_only": True}, {}):
+        try:
+            buffer = io.BytesIO(file_bytes)
+            excel_file = pd.ExcelFile(buffer, engine="openpyxl", engine_kwargs=engine_kwargs)
+            return excel_file.sheet_names, "openpyxl"
+        except Exception as exc:
+            errors.append(f"openpyxl: {exc}")
+    try:
+        return [s["name"] for s in _xlsx_get_sheet_paths(file_bytes)], "xmlzip"
+    except Exception as exc:
+        errors.append(f"xmlzip: {exc}")
     raise RuntimeError("无法读取 Excel 工作表列表：\n" + "\n".join(errors))
 
 def read_uploaded_excel(file_obj, sheet_name):
     file_bytes = _excel_file_bytes(file_obj)
     filename = getattr(file_obj, "name", "upload.xlsx").lower()
-    attempts = []
-    if filename.endswith(".xls") and not filename.endswith(".xlsx"):
-        attempts.append(("xlrd", {}))
-    attempts.extend([
-        ("calamine", {}),
-        ("openpyxl", {"read_only": True, "data_only": True}),
-        ("openpyxl", {}),
-    ])
     errors = []
-    for engine, engine_kwargs in attempts:
+    if filename.endswith(".xls") and not filename.endswith(".xlsx"):
         try:
             buffer = io.BytesIO(file_bytes)
-            if engine_kwargs:
-                df = pd.read_excel(buffer, sheet_name=sheet_name, engine=engine, engine_kwargs=engine_kwargs)
-            else:
-                df = pd.read_excel(buffer, sheet_name=sheet_name, engine=engine)
-            return df, engine
+            df = pd.read_excel(buffer, sheet_name=sheet_name, engine="xlrd")
+            return df, "xlrd"
         except Exception as exc:
-            errors.append(f"{engine}: {exc}")
+            errors.append(f"xlrd: {exc}")
+    if _calamine_available():
+        try:
+            buffer = io.BytesIO(file_bytes)
+            df = pd.read_excel(buffer, sheet_name=sheet_name, engine="calamine")
+            return df, "calamine"
+        except Exception as exc:
+            errors.append(f"calamine: {exc}")
+    for engine_kwargs in ({"read_only": True, "data_only": True}, {}):
+        try:
+            buffer = io.BytesIO(file_bytes)
+            df = pd.read_excel(buffer, sheet_name=sheet_name, engine="openpyxl", engine_kwargs=engine_kwargs)
+            return df, engine_kwargs and "openpyxl-readonly" or "openpyxl"
+        except Exception as exc:
+            errors.append(f"openpyxl: {exc}")
+    try:
+        df = _xlsx_read_sheet_xml(file_bytes, sheet_name)
+        return df, "xmlzip"
+    except Exception as exc:
+        errors.append(f"xmlzip: {exc}")
     raise RuntimeError("无法读取 Excel 数据：\n" + "\n".join(errors))
 
 def prepare_import_dataframe(df_raw, col_map, col_names):
