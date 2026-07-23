@@ -575,7 +575,7 @@ elif page == "📤 导入历史数据":
     4. 点击「开始导入」
     """)
     
-    uploaded_file = st.file_uploader("选择 Excel 文件", type=["xlsx", "xls"])
+    uploaded_file = st.file_uploader("选择 Excel 文件", type=["xlsx", "xls"], key="upload_import")
     
     if uploaded_file is not None:
         try:
