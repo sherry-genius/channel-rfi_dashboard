@@ -30,7 +30,7 @@ TRANSACTION_STATUS_OPTIONS = ["已到账", "未到账", "渠道退款", "商户�
 # ========== 页面配置 ==========
 st.set_page_config(page_title="调单管理系统", layout="wide")
 st.title("📋 调单管理系统")
-st.warning("✅ 测试版本 v1.0.13 - 2026-07-24（对客RFI 通讯录）")
+st.warning("✅ 测试版本 v1.0.14 - 2026-07-24（通讯录加载修复）")
 
 # ========== 初始化 Supabase 连接 ==========
 try:
@@ -928,31 +928,74 @@ def get_rfi_email_defaults():
         return {"to": "", "cc": "", "webmail_url": "https://qiye.163.com/login/"}
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
-CONTACTS_CSV_FILE = os.path.join(APP_DIR, "通讯录导出数据.csv")
+CONTACTS_CSV_NAME = "通讯录导出数据.csv"
 CONTACTS_CUSTOM_FILE = os.path.join(APP_DIR, "rfi_contacts_custom.json")
-CONTACTS_EMAIL_COLUMNS = ["邮件地址（必填）", "备用邮箱1", "备用邮箱2", "备用邮箱3", "备用邮箱4"]
 
-def _normalize_contact_email(email):
-    email = clean_import_str(email)
-    if not email or "@" not in email:
-        return ""
-    return email
-
-@st.cache_data(ttl=300)
-def load_contacts_from_csv():
-    if not os.path.exists(CONTACTS_CSV_FILE):
-        return []
+def resolve_contacts_csv_path():
+    candidates = [
+        os.path.join(APP_DIR, CONTACTS_CSV_NAME),
+        os.path.join(os.getcwd(), CONTACTS_CSV_NAME),
+    ]
+    seen = set()
+    for path in candidates:
+        norm = os.path.normpath(path)
+        if norm in seen:
+            continue
+        seen.add(norm)
+        if os.path.exists(norm):
+            return norm
     try:
-        df = pd.read_csv(CONTACTS_CSV_FILE, dtype=str).fillna("")
+        cfg = st.secrets.get("rfi_email", {})
+        custom_path = clean_import_str(cfg.get("contacts_csv", ""))
+        if custom_path and os.path.exists(custom_path):
+            return os.path.normpath(custom_path)
     except Exception:
-        return []
+        pass
+    return None
+
+def _normalize_csv_header(df):
+    df = df.copy()
+    df.columns = [str(c).strip().lstrip("\ufeff") for c in df.columns]
+    return df
+
+def _detect_contacts_columns(df):
+    name_col = None
+    email_cols = []
+    for col in df.columns:
+        col_text = str(col)
+        col_lower = col_text.lower()
+        if name_col is None and ("姓名" in col_text or col_lower in ("name", "联系人", "名称")):
+            name_col = col
+        if (
+            "邮件地址" in col_text
+            or "备用邮箱" in col_text
+            or "email" in col_lower
+            or col_text.endswith("邮箱")
+        ):
+            email_cols.append(col)
+    if name_col is None and len(df.columns) > 0:
+        name_col = df.columns[0]
+    if not email_cols and len(df.columns) > 1:
+        email_cols = [df.columns[1]]
+    return name_col, email_cols
+
+def _read_contacts_csv(csv_path):
+    last_error = None
+    for encoding in ("utf-8-sig", "utf-8", "gbk", "gb18030"):
+        try:
+            df = pd.read_csv(csv_path, dtype=str, encoding=encoding)
+            return _normalize_csv_header(df.fillna("")), None
+        except Exception as exc:
+            last_error = str(exc)
+    return pd.DataFrame(), last_error
+
+def _parse_contacts_dataframe(df):
+    name_col, email_cols = _detect_contacts_columns(df)
     contacts = []
     seen = set()
     for _, row in df.iterrows():
-        name = clean_import_str(row.get("姓名", ""))
-        for col in CONTACTS_EMAIL_COLUMNS:
-            if col not in df.columns:
-                continue
+        name = clean_import_str(row.get(name_col, "")) if name_col is not None else ""
+        for col in email_cols:
             email = _normalize_contact_email(row.get(col, ""))
             email_key = email.lower()
             if email and email_key not in seen:
@@ -960,6 +1003,20 @@ def load_contacts_from_csv():
                 contacts.append({"name": name or email.split("@")[0], "email": email, "source": "csv"})
     contacts.sort(key=lambda c: (c["name"].lower(), c["email"].lower()))
     return contacts
+
+def load_contacts_from_csv():
+    csv_path = resolve_contacts_csv_path()
+    if not csv_path:
+        return [], None, f"未找到 {CONTACTS_CSV_NAME}，请与 app.py 放在同一目录并提交到 Git"
+    df, read_error = _read_contacts_csv(csv_path)
+    if read_error:
+        return [], csv_path, f"读取通讯录失败：{read_error}"
+    if len(df) == 0:
+        return [], csv_path, "通讯录 CSV 为空"
+    contacts = _parse_contacts_dataframe(df)
+    if not contacts:
+        return [], csv_path, "通讯录 CSV 中未识别到有效邮箱列，请检查表头"
+    return contacts, csv_path, None
 
 def load_custom_contacts_from_file():
     if not os.path.exists(CONTACTS_CUSTOM_FILE):
@@ -989,22 +1046,50 @@ def save_custom_contacts_to_file(contacts):
     except Exception:
         return False
 
+def _normalize_contact_email(email):
+    email = clean_import_str(email)
+    if not email or "@" not in email:
+        return ""
+    return email
+
 def init_rfi_custom_contacts():
     if "rfi_custom_contacts" not in st.session_state:
         st.session_state["rfi_custom_contacts"] = load_custom_contacts_from_file()
 
-def get_rfi_contacts():
+def get_rfi_contacts_meta():
     init_rfi_custom_contacts()
-    merged = []
-    seen = set()
-    for contact in load_contacts_from_csv() + st.session_state["rfi_custom_contacts"]:
-        email_key = contact["email"].lower()
-        if email_key in seen:
-            continue
-        seen.add(email_key)
-        merged.append(contact)
-    merged.sort(key=lambda c: (c["name"].lower(), c["email"].lower()))
-    return merged
+    csv_mtime = None
+    csv_path = resolve_contacts_csv_path()
+    if csv_path:
+        try:
+            csv_mtime = os.path.getmtime(csv_path)
+        except Exception:
+            csv_mtime = None
+    cache_key = (csv_path, csv_mtime, len(st.session_state["rfi_custom_contacts"]))
+    if st.session_state.get("_rfi_contacts_cache_key") != cache_key:
+        csv_contacts, loaded_path, csv_error = load_contacts_from_csv()
+        merged = []
+        seen = set()
+        for contact in csv_contacts + st.session_state["rfi_custom_contacts"]:
+            email_key = contact["email"].lower()
+            if email_key in seen:
+                continue
+            seen.add(email_key)
+            merged.append(contact)
+        merged.sort(key=lambda c: (c["name"].lower(), c["email"].lower()))
+        st.session_state["_rfi_contacts_cache_key"] = cache_key
+        st.session_state["rfi_all_contacts"] = merged
+        st.session_state["rfi_contacts_csv_path"] = loaded_path
+        st.session_state["rfi_contacts_error"] = csv_error
+    return (
+        st.session_state.get("rfi_all_contacts", []),
+        st.session_state.get("rfi_contacts_csv_path"),
+        st.session_state.get("rfi_contacts_error"),
+    )
+
+def get_rfi_contacts():
+    contacts, _, _ = get_rfi_contacts_meta()
+    return contacts
 
 def search_rfi_contacts(query, contacts, limit=20):
     q = clean_import_str(query).lower()
@@ -1050,6 +1135,7 @@ def add_rfi_custom_contact(name, email):
             return False, "该邮箱已在通讯录中"
     new_contact = {"name": name, "email": email, "source": "custom"}
     st.session_state["rfi_custom_contacts"].append(new_contact)
+    st.session_state.pop("_rfi_contacts_cache_key", None)
     saved = save_custom_contacts_to_file(st.session_state["rfi_custom_contacts"])
     if saved:
         return True, f"已添加：{name} · {email}"
@@ -1078,6 +1164,8 @@ def render_rfi_recipient_contact_picker(contacts):
                 )
                 st.rerun()
         st.caption(f"📇 输入「{token}」匹配到 {len(matches)} 个联系人，选择后点「填入」")
+    elif token and not contacts:
+        st.warning("通讯录尚未加载，无法匹配。请确认「通讯录导出数据.csv」已与 app.py 一并部署。")
     elif token:
         st.caption(f"📇 未找到包含「{token}」的联系人，可直接手动输入邮箱")
 
@@ -1782,9 +1870,14 @@ elif page == "📨 对客RFI":
 
         with st.container(border=True):
             st.markdown("##### ✉️ 新邮件")
-            rfi_contacts = get_rfi_contacts()
+            rfi_contacts, contacts_csv_path, contacts_error = get_rfi_contacts_meta()
             if rfi_contacts:
-                st.caption(f"📇 已加载通讯录 {len(rfi_contacts)} 个邮箱（含 CSV 与手动添加）")
+                source_name = os.path.basename(contacts_csv_path) if contacts_csv_path else CONTACTS_CSV_NAME
+                st.caption(f"📇 已加载通讯录 **{len(rfi_contacts)}** 个邮箱（CSV：{source_name} + 手动添加）")
+            else:
+                st.error(contacts_error or f"通讯录为空，请将「{CONTACTS_CSV_NAME}」与 app.py 放在同一目录并 git push")
+                if contacts_csv_path:
+                    st.caption(f"检测到文件：{contacts_csv_path}")
             mail_to = st.text_input(
                 "收件人",
                 placeholder="输入姓名或邮箱关键字匹配通讯录，如 yy；多个收件人用逗号分隔",
