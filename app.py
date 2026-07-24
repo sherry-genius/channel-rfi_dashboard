@@ -763,6 +763,28 @@ def build_biz_type_summary(df):
     pivot[num_cols] = pivot[num_cols].astype(int)
     return pivot
 
+def apply_all_data_filters(df, range_start, range_end, selected_biz, selected_type, selected_channel, keyword):
+    filtered = df.copy()
+    if "收件日期" in filtered.columns:
+        date_col = pd.to_datetime(filtered["收件日期"], errors="coerce")
+        filtered = filtered[date_col.notna() & (date_col.dt.date >= range_start) & (date_col.dt.date <= range_end)]
+    if selected_biz != "全部":
+        filtered = filtered[filtered["业务线"] == selected_biz]
+    if selected_type != "全部":
+        filtered = filtered[filtered["调单类型"] == selected_type]
+    if selected_channel != "全部":
+        filtered = filtered[filtered["渠道"].astype(str).str.strip() == selected_channel]
+    keyword = keyword.strip()
+    if keyword:
+        kw = keyword.lower()
+        text_cols = ["商户ID", "商户名称", "邮件标题", "渠道", "调单内容分类", "调单内容详情"]
+        mask = pd.Series(False, index=filtered.index)
+        for col in text_cols:
+            if col in filtered.columns:
+                mask = mask | filtered[col].fillna("").astype(str).str.lower().str.contains(kw, regex=False)
+        filtered = filtered[mask]
+    return filtered
+
 def build_monthly_count_with_mom_chart(trend_df):
     import altair as alt
     data = trend_df.copy().sort_values("收件日期").reset_index(drop=True)
@@ -1245,14 +1267,59 @@ elif page == "📄 查看全部数据":
         if len(df) == 0:
             st.info("暂无数据")
         else:
-            st.write(f"共 **{len(df)}** 条记录")
+            work_df = df.copy()
+            work_df["金额"] = pd.to_numeric(work_df["金额"], errors="coerce").fillna(0)
+            date_series = pd.to_datetime(work_df["收件日期"], errors="coerce")
+            valid_dates = date_series.dropna()
+            today = datetime.date.today()
+            if len(valid_dates) > 0:
+                data_min = valid_dates.min().date()
+                data_max = valid_dates.max().date()
+            else:
+                data_min = data_max = today
+            default_end = data_max
+            default_start = default_end.replace(day=1)
+            if default_start < data_min:
+                default_start = data_min
+
+            st.subheader("🔎 筛选搜索")
+            fcol1, fcol2, fcol3, fcol4 = st.columns(4)
+            with fcol1:
+                date_range = st.date_input(
+                    "收件日期",
+                    value=(default_start, default_end),
+                    min_value=data_min,
+                    max_value=data_max,
+                    key="all_data_date_range",
+                )
+                range_start, range_end = normalize_date_range(date_range, default_start, default_end)
+            with fcol2:
+                biz_list = ["全部"] + sorted(work_df["业务线"].dropna().astype(str).str.strip().replace("", pd.NA).dropna().unique().tolist())
+                selected_biz = st.selectbox("业务线", biz_list, key="all_data_biz")
+            with fcol3:
+                type_list = ["全部"] + sorted(work_df["调单类型"].dropna().astype(str).unique().tolist())
+                selected_type = st.selectbox("调单类型", type_list, key="all_data_type")
+            with fcol4:
+                channel_list = ["全部"] + sorted(work_df["渠道"].dropna().astype(str).str.strip().replace("", pd.NA).dropna().unique().tolist())
+                selected_channel = st.selectbox("渠道", channel_list, key="all_data_channel")
+            keyword = st.text_input(
+                "关键词搜索",
+                placeholder="搜索商户ID、商户名称、邮件标题、渠道、调单内容…",
+                key="all_data_keyword",
+            )
+            filtered_df = apply_all_data_filters(
+                work_df, range_start, range_end, selected_biz, selected_type, selected_channel, keyword
+            )
+            st.write(f"筛选结果：**{len(filtered_df)}** / {len(work_df)} 条")
+            if len(filtered_df) == 0:
+                st.warning("没有符合筛选条件的数据，请调整筛选条件")
+                st.stop()
             st.info("💡 可直接在下方表格中修改数据，修改完成后点击「保存修改」写入数据库")
-            type_options = sorted(set(STAT_TYPE_OPTIONS) | set(df['调单类型'].dropna().astype(str)))
-            biz_options = sorted(set(["电商", "B2B", "服贸汇兑", "其他"]) | set(df['业务线'].dropna().astype(str)))
-            content_options = sorted(set([c for c in CONTENT_CATEGORIES if c]) | set(df['调单内容分类'].dropna().astype(str)))
-            currency_options = sorted(set(CURRENCY_OPTIONS) | set(df['币种'].dropna().astype(str)))
-            display_df = df.copy()
-            display_df['金额'] = pd.to_numeric(display_df['金额'], errors='coerce').fillna(0)
+            type_options = sorted(set(STAT_TYPE_OPTIONS) | set(work_df['调单类型'].dropna().astype(str)))
+            biz_options = sorted(set(["电商", "B2B", "服贸汇兑", "其他"]) | set(work_df['业务线'].dropna().astype(str)))
+            content_options = sorted(set([c for c in CONTENT_CATEGORIES if c]) | set(work_df['调单内容分类'].dropna().astype(str)))
+            currency_options = sorted(set(CURRENCY_OPTIONS) | set(work_df['币种'].dropna().astype(str)))
+            display_df = filtered_df.copy()
             edited_df = st.data_editor(
                 display_df,
                 use_container_width=True,
@@ -1290,7 +1357,7 @@ elif page == "📄 查看全部数据":
                             st.info("没有检测到变更")
             with btn_col2:
                 csv = edited_df.to_csv(index=False).encode('utf-8-sig')
-                st.download_button("📥 导出为CSV", csv, "调单数据.csv", "text/csv")
+                st.download_button("📥 导出筛选结果", csv, "调单数据.csv", "text/csv")
             st.markdown("---")
             st.subheader("删除单条记录")
             col1, col2 = st.columns([1, 3])
