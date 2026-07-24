@@ -10,6 +10,10 @@ import xml.etree.ElementTree as ET
 import urllib.request
 import urllib.parse
 import html as html_lib
+import imaplib
+import email as email_lib
+from email.header import decode_header
+from email.utils import parsedate_to_datetime, parseaddr
 from copy import deepcopy
 from supabase import create_client
 
@@ -28,10 +32,11 @@ STAT_TYPE_OPTIONS = ["Recall", "Personal Information", "Retrieval Request"]
 CONTENT_CATEGORIES = ["", "KYC问询", "单笔交易问询", "账户调查", "结汇", "警方协查", "Recall"]
 TRANSACTION_TYPE_OPTIONS = ["入账", "出款"]
 TRANSACTION_STATUS_OPTIONS = ["已到账", "未到账", "渠道退款", "商户退款"]
+DIAODAN_STATUS_OPTIONS = ["待处理", "处理中", "已回复", "已结案"]
 
 # ========== 版本信息 ==========
-APP_VERSION = "v1.0.20"
-APP_VERSION_NOTE = "成长日记可在线新增"
+APP_VERSION = "v1.0.21"
+APP_VERSION_NOTE = "调单状态 + 邮箱同步"
 
 # ========== 页面配置 ==========
 st.set_page_config(page_title="调单管理系统", layout="wide")
@@ -702,6 +707,311 @@ def save_edited_records(edited_df):
     st.cache_data.clear()
     return updated_count
 
+def parse_diaodan_detail_json(value):
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return {}
+    text = str(value).strip()
+    if not text:
+        return {}
+    try:
+        data = json.loads(text)
+        if isinstance(data, dict):
+            return data
+    except (json.JSONDecodeError, TypeError):
+        pass
+    return {"_legacy_text": text}
+
+def get_diaodan_status_from_row(row):
+    detail = parse_diaodan_detail_json(row.get("调单内容详情"))
+    status = clean_import_str(detail.get("调单状态"))
+    if status in DIAODAN_STATUS_OPTIONS:
+        return status
+    return "待处理"
+
+def build_diaodan_detail_with_status(existing_detail, status, extra=None):
+    detail = parse_diaodan_detail_json(existing_detail)
+    if "_legacy_text" in detail and len(detail) == 1:
+        detail = {"备注": detail["_legacy_text"]}
+    detail["调单状态"] = status if status in DIAODAN_STATUS_OPTIONS else "待处理"
+    if extra:
+        detail.update(extra)
+    return json.dumps(detail, ensure_ascii=False)
+
+def enrich_df_with_status(df):
+    if len(df) == 0:
+        return df
+    work = df.copy()
+    work["调单状态"] = work.apply(get_diaodan_status_from_row, axis=1)
+    detail = work["调单内容详情"].apply(parse_diaodan_detail_json)
+    work["邮件来源"] = detail.apply(lambda d: clean_import_str(d.get("发件人")))
+    work["同步来源"] = detail.apply(lambda d: clean_import_str(d.get("同步来源")))
+    return work
+
+def collect_existing_email_message_ids(df):
+    ids = set()
+    if len(df) == 0:
+        return ids
+    for _, row in df.iterrows():
+        detail = parse_diaodan_detail_json(row.get("调单内容详情"))
+        message_id = clean_import_str(detail.get("邮件MessageId"))
+        if message_id:
+            ids.add(message_id)
+    return ids
+
+def update_diaodan_status_by_id(record_id, status, existing_detail=""):
+    update_data = to_db_record({
+        "调单内容详情": build_diaodan_detail_with_status(existing_detail, status),
+    })
+    if not update_data:
+        return False
+    supabase.table("diaodan").update(update_data).eq("id", int(record_id)).execute()
+    st.cache_data.clear()
+    return True
+
+def save_diaodan_status_edits(edited_df, source_df):
+    if len(edited_df) == 0:
+        return 0
+    source_map = source_df.set_index("id") if "id" in source_df.columns else pd.DataFrame()
+    updated = 0
+    for _, row in edited_df.iterrows():
+        rid = int(row["id"])
+        new_status = clean_import_str(row.get("调单状态"))
+        if new_status not in DIAODAN_STATUS_OPTIONS:
+            continue
+        old_status = "待处理"
+        old_detail = ""
+        if rid in source_map.index:
+            old_row = source_map.loc[rid]
+            old_status = get_diaodan_status_from_row(old_row)
+            old_detail = old_row.get("调单内容详情", "")
+        if new_status == old_status:
+            continue
+        if update_diaodan_status_by_id(rid, new_status, old_detail):
+            updated += 1
+    return updated
+
+def get_email_sync_config():
+    defaults = {
+        "enabled": False,
+        "imap_host": "imap.qiye.163.com",
+        "imap_port": 993,
+        "username": "",
+        "password": "",
+        "folder": "INBOX",
+        "days": 14,
+        "keyword": "",
+        "auto_sync_on_open": False,
+    }
+    try:
+        cfg = st.secrets.get("email_sync", {})
+        merged = defaults.copy()
+        merged.update({k: cfg.get(k, v) for k, v in defaults.items()})
+        merged["enabled"] = bool(cfg.get("enabled", merged["username"] and merged["password"]))
+        merged["imap_port"] = int(merged.get("imap_port") or 993)
+        merged["days"] = int(merged.get("days") or 14)
+        merged["auto_sync_on_open"] = bool(cfg.get("auto_sync_on_open", False))
+        return merged
+    except Exception:
+        return defaults
+
+def decode_mime_words(value):
+    if not value:
+        return ""
+    parts = decode_header(value)
+    chunks = []
+    for text, charset in parts:
+        if isinstance(text, bytes):
+            chunks.append(text.decode(charset or "utf-8", errors="ignore"))
+        else:
+            chunks.append(str(text))
+    return "".join(chunks).strip()
+
+def extract_email_text_body(msg, max_len=800):
+    chunks = []
+    if msg.is_multipart():
+        for part in msg.walk():
+            content_type = part.get_content_type()
+            disposition = str(part.get("Content-Disposition") or "").lower()
+            if "attachment" in disposition:
+                continue
+            if content_type not in ("text/plain", "text/html"):
+                continue
+            payload = part.get_payload(decode=True)
+            if not payload:
+                continue
+            charset = part.get_content_charset() or "utf-8"
+            chunks.append(payload.decode(charset, errors="ignore"))
+            if sum(len(x) for x in chunks) >= max_len:
+                break
+    else:
+        payload = msg.get_payload(decode=True)
+        if payload:
+            charset = msg.get_content_charset() or "utf-8"
+            chunks.append(payload.decode(charset, errors="ignore"))
+    text = "\n".join(chunks)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:max_len]
+
+def infer_channel_from_email(from_addr, subject=""):
+    addr = from_addr.lower()
+    subject_lower = subject.lower()
+    rules = [
+        ("dbs.com", "DBS"),
+        ("bankingcircle.com", "Banking Circle"),
+        ("sc.com", "SCB"),
+        ("thunes.com", "Thunes"),
+        ("baofu.com", "宝付"),
+        ("gepholding.com", "GEP"),
+        ("pingpongx.com", "PingPong"),
+        ("pyvio", "Pyvio"),
+        ("nium.com", "Nium"),
+    ]
+    for key, name in rules:
+        if key in addr or key in subject_lower:
+            return name
+    domain = addr.split("@")[-1] if "@" in addr else addr
+    return domain or "邮件"
+
+def infer_order_type_from_subject(subject):
+    text = subject.lower()
+    if "recall" in text:
+        return "Recall"
+    if "personal information" in text:
+        return "Personal Information"
+    return "Retrieval Request"
+
+def build_email_diaodan_record(msg, message_id):
+    subject = decode_mime_words(msg.get("Subject")) or "（无主题）"
+    from_raw = decode_mime_words(msg.get("From"))
+    _, from_addr = parseaddr(from_raw)
+    from_addr = clean_import_str(from_addr) or from_raw
+    receive_dt = parsedate_to_datetime(msg.get("Date")) if msg.get("Date") else datetime.datetime.now()
+    if isinstance(receive_dt, datetime.datetime):
+        receive_date = receive_dt.date().isoformat()
+    else:
+        receive_date = datetime.date.today().isoformat()
+    body_snippet = extract_email_text_body(msg)
+    detail = {
+        "调单状态": "待处理",
+        "邮件MessageId": message_id,
+        "发件人": from_addr,
+        "邮件摘要": body_snippet,
+        "同步来源": "邮箱IMAP",
+        "同步时间": datetime.datetime.now().isoformat(),
+    }
+    return {
+        "收件日期": receive_date,
+        "商户ID": "未填写",
+        "商户名称": "未填写",
+        "调单类型": infer_order_type_from_subject(subject),
+        "金额": 0,
+        "币种": "USD",
+        "业务线": "其他",
+        "渠道": infer_channel_from_email(from_addr, subject),
+        "邮件标题": subject,
+        "调单内容分类": "",
+        "调单内容详情": json.dumps(detail, ensure_ascii=False),
+        "登记时间": datetime.datetime.now().isoformat(),
+    }
+
+def sync_emails_from_imap(config=None):
+    config = config or get_email_sync_config()
+    if not config.get("username") or not config.get("password"):
+        return {
+            "ok": False,
+            "error": "未配置邮箱账号。请在 Streamlit Secrets 添加 [email_sync]（见本页说明）。",
+            "new_count": 0,
+            "skip_count": 0,
+            "fail_count": 0,
+        }
+    keyword = clean_import_str(config.get("keyword")).lower()
+    existing_df = load_all_data()
+    existing_message_ids = collect_existing_email_message_ids(existing_df)
+    existing_title_keys = set()
+    if len(existing_df) > 0:
+        for _, row in existing_df.iterrows():
+            existing_title_keys.add(import_dedup_key({
+                "邮件标题": clean_import_str(row.get("邮件标题")),
+                "商户ID": clean_import_str(row.get("商户ID")) or "未填写",
+                "收件日期": clean_import_str(row.get("收件日期")),
+                "调单类型": clean_import_str(row.get("调单类型")),
+                "渠道": clean_import_str(row.get("渠道")),
+                "金额": row.get("金额", 0),
+            }))
+    new_count = 0
+    skip_count = 0
+    fail_count = 0
+    errors = []
+    mail = None
+    try:
+        mail = imaplib.IMAP4_SSL(str(config["imap_host"]), int(config["imap_port"]))
+        mail.login(str(config["username"]), str(config["password"]))
+        folder = str(config.get("folder") or "INBOX")
+        status, _ = mail.select(folder)
+        if status != "OK":
+            return {"ok": False, "error": f"无法打开邮箱文件夹：{folder}", "new_count": 0, "skip_count": 0, "fail_count": 0}
+        since_date = datetime.date.today() - datetime.timedelta(days=int(config.get("days") or 14))
+        search_criteria = f'(SINCE {since_date.strftime("%d-%b-%Y")})'
+        status, data = mail.search(None, search_criteria)
+        if status != "OK":
+            return {"ok": False, "error": "邮箱搜索失败", "new_count": 0, "skip_count": 0, "fail_count": 0}
+        ids = data[0].split()
+        ids = ids[-100:]
+        for num in reversed(ids):
+            try:
+                status, msg_data = mail.fetch(num, "(RFC822)")
+                if status != "OK" or not msg_data or not msg_data[0]:
+                    continue
+                raw = msg_data[0][1]
+                msg = email_lib.message_from_bytes(raw)
+                message_id = clean_import_str(msg.get("Message-ID")) or f"{num.decode()}-{clean_import_str(msg.get('Subject'))}"
+                if message_id in existing_message_ids:
+                    skip_count += 1
+                    continue
+                subject = decode_mime_words(msg.get("Subject")) or ""
+                if keyword and keyword not in subject.lower():
+                    skip_count += 1
+                    continue
+                record = build_email_diaodan_record(msg, message_id)
+                title_key = import_dedup_key(record)
+                if title_key in existing_title_keys:
+                    skip_count += 1
+                    continue
+                db_record = to_db_record(record)
+                supabase.table("diaodan").insert(db_record).execute()
+                new_count += 1
+                existing_message_ids.add(message_id)
+                existing_title_keys.add(title_key)
+            except Exception as exc:
+                fail_count += 1
+                if len(errors) < 3:
+                    errors.append(str(exc))
+        st.cache_data.clear()
+        return {
+            "ok": True,
+            "error": None,
+            "new_count": new_count,
+            "skip_count": skip_count,
+            "fail_count": fail_count,
+            "errors": errors,
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error": str(exc),
+            "new_count": new_count,
+            "skip_count": skip_count,
+            "fail_count": fail_count,
+            "errors": errors,
+        }
+    finally:
+        if mail is not None:
+            try:
+                mail.logout()
+            except Exception:
+                pass
+
 def find_transaction_history(商户ID, 汇款方, 收款方):
     df = load_all_data()
     if len(df) == 0:
@@ -1309,6 +1619,17 @@ INTERNAL_RFI_TEMPLATES = {
 
 DEVELOPER_CHANGELOG = [
     {
+        "version": "v1.0.21",
+        "date": "2026-07-24",
+        "emoji": "📬",
+        "title": "调单状态 + 邮箱同步",
+        "tags": ["新功能"],
+        "items": [
+            "新增「调单状态」页：跟踪待处理 / 处理中 / 已回复 / 已结案",
+            "支持 IMAP 从企业邮箱拉取新邮件并自动生成调单（需配置 Secrets）",
+        ],
+    },
+    {
         "version": "v1.0.20",
         "date": "2026-07-24",
         "emoji": "✍️",
@@ -1783,7 +2104,7 @@ def render_developer_log_page():
 # ========== 侧边栏导航 ==========
 page = st.sidebar.radio(
     "📌 功能导航",
-    ["📊 调单看板", "📝 登记调单", "📤 导入历史数据", "📄 查看全部数据", "📧 回复渠道调单", "📨 对客RFI", "🐱 小陈的成长日记"]
+    ["📊 调单看板", "📝 登记调单", "📬 调单状态", "📤 导入历史数据", "📄 查看全部数据", "📧 回复渠道调单", "📨 对客RFI", "🐱 小陈的成长日记"]
 )
 
 # ============================================================
@@ -2016,7 +2337,134 @@ elif page == "📝 登记调单":
                 st.balloons()
 
 # ============================================================
-# PAGE 3: 导入历史数据
+# PAGE 3: 调单状态
+# ============================================================
+elif page == "📬 调单状态":
+    st.header("📬 调单状态")
+    email_cfg = get_email_sync_config()
+    st.info(
+        "**关于「自动」：** Streamlit 无法在后台 24 小时监听邮箱。"
+        "当前方案是：打开本页时同步，或点击下方按钮手动同步。"
+        "若需真正实时自动入库，需另配定时任务（如服务器 cron / GitHub Actions）。"
+    )
+
+    with st.expander("⚙️ 邮箱同步配置说明（Streamlit Secrets）"):
+        st.markdown("""
+在 Streamlit Cloud → **Settings → Secrets** 中添加：
+
+```toml
+[email_sync]
+enabled = true
+imap_host = "imap.qiye.163.com"
+imap_port = 993
+username = "your.name@company.com"
+password = "邮箱授权码或专用密码"
+folder = "INBOX"
+days = 14
+keyword = "RFI"
+auto_sync_on_open = true
+```
+
+- **网易企业邮箱** 常用 `imap.qiye.163.com:993`
+- `keyword` 可选：仅同步主题包含该词的邮件（留空则同步近 N 天全部）
+- `auto_sync_on_open = true` 时，每次打开本页自动拉取一次
+        """)
+
+    sync_col1, sync_col2, sync_col3 = st.columns([1.2, 1.2, 2])
+    with sync_col1:
+        if st.button("🔄 从邮箱同步新调单", type="primary", use_container_width=True):
+            with st.spinner("正在连接邮箱并拉取邮件…"):
+                sync_result = sync_emails_from_imap(email_cfg)
+            st.session_state["last_email_sync_result"] = sync_result
+            st.rerun()
+    with sync_col2:
+        auto_sync = st.checkbox("打开本页自动同步", value=bool(email_cfg.get("auto_sync_on_open")))
+    with sync_col3:
+        if email_cfg.get("username"):
+            st.caption(f"已配置邮箱：**{email_cfg['username']}** · 近 **{email_cfg.get('days', 14)}** 天 · 文件夹 **{email_cfg.get('folder', 'INBOX')}**")
+        else:
+            st.caption("尚未配置邮箱 Secrets，可先手动登记调单，或按上方说明配置后同步。")
+
+    if auto_sync and email_cfg.get("username") and email_cfg.get("password"):
+        if not st.session_state.get("_email_auto_sync_done"):
+            with st.spinner("自动同步邮箱中…"):
+                sync_result = sync_emails_from_imap(email_cfg)
+            st.session_state["_email_auto_sync_done"] = True
+            st.session_state["last_email_sync_result"] = sync_result
+
+    last_sync = st.session_state.get("last_email_sync_result")
+    if last_sync:
+        if last_sync.get("ok"):
+            st.success(
+                f"同步完成：新增 **{last_sync.get('new_count', 0)}** 条，"
+                f"跳过 **{last_sync.get('skip_count', 0)}** 条，"
+                f"失败 **{last_sync.get('fail_count', 0)}** 条"
+            )
+            if last_sync.get("errors"):
+                for err in last_sync["errors"]:
+                    st.warning(err)
+        else:
+            st.error(f"同步失败：{last_sync.get('error')}")
+
+    df = load_all_data()
+    if len(df) == 0:
+        st.info("暂无调单数据。可点击「从邮箱同步新调单」或前往「登记调单」。")
+        st.stop()
+
+    work_df = enrich_df_with_status(df)
+    status_counts = work_df["调单状态"].value_counts()
+    m1, m2, m3, m4, m5 = st.columns(5)
+    for col, status in zip([m1, m2, m3, m4, m5], DIAODAN_STATUS_OPTIONS):
+        with col:
+            st.metric(status, f"{int(status_counts.get(status, 0)):,}")
+    with m5:
+        email_sync_count = len(work_df[work_df["同步来源"] == "邮箱IMAP"])
+        st.metric("📨 邮箱导入", f"{email_sync_count:,}")
+
+    st.subheader("📋 状态管理")
+    filter_status = st.selectbox("筛选状态", ["全部"] + DIAODAN_STATUS_OPTIONS, key="status_page_filter")
+    filtered = work_df.copy()
+    if filter_status != "全部":
+        filtered = filtered[filtered["调单状态"] == filter_status]
+
+    display_cols = ["id", "调单状态", "收件日期", "邮件标题", "渠道", "调单类型", "商户名称", "邮件来源", "同步来源"]
+    present_cols = [c for c in display_cols if c in filtered.columns]
+    show_df = filtered[present_cols].sort_values("id", ascending=False)
+
+    edited_status_df = st.data_editor(
+        show_df,
+        use_container_width=True,
+        height=480,
+        num_rows="fixed",
+        disabled=[c for c in present_cols if c != "调单状态"],
+        column_config={
+            "id": st.column_config.NumberColumn("ID", disabled=True),
+            "调单状态": st.column_config.SelectboxColumn("调单状态", options=DIAODAN_STATUS_OPTIONS, required=True),
+            "收件日期": st.column_config.TextColumn("收件日期", disabled=True),
+            "邮件标题": st.column_config.TextColumn("邮件标题", disabled=True),
+            "渠道": st.column_config.TextColumn("渠道", disabled=True),
+            "调单类型": st.column_config.TextColumn("调单类型", disabled=True),
+            "商户名称": st.column_config.TextColumn("商户名称", disabled=True),
+            "邮件来源": st.column_config.TextColumn("发件人", disabled=True),
+            "同步来源": st.column_config.TextColumn("来源", disabled=True),
+        },
+        key="diaodan_status_editor",
+    )
+
+    s_col1, s_col2 = st.columns([1, 3])
+    with s_col1:
+        if st.button("💾 保存状态变更", type="primary"):
+            updated = save_diaodan_status_edits(edited_status_df, work_df)
+            if updated > 0:
+                st.success(f"✅ 已更新 {updated} 条状态")
+                st.rerun()
+            else:
+                st.info("没有检测到状态变更")
+    with s_col2:
+        st.caption("从邮箱同步的记录默认状态为「待处理」。处理完成后可改为「已回复」或「已结案」。")
+
+# ============================================================
+# PAGE 4: 导入历史数据
 # ============================================================
 elif page == "📤 导入历史数据":
     st.header("📤 导入历史数据")
