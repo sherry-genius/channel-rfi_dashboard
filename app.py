@@ -9,6 +9,7 @@ import zipfile
 import xml.etree.ElementTree as ET
 import urllib.request
 import urllib.parse
+import html as html_lib
 from copy import deepcopy
 from supabase import create_client
 
@@ -29,8 +30,8 @@ TRANSACTION_TYPE_OPTIONS = ["入账", "出款"]
 TRANSACTION_STATUS_OPTIONS = ["已到账", "未到账", "渠道退款", "商户退款"]
 
 # ========== 版本信息 ==========
-APP_VERSION = "v1.0.18"
-APP_VERSION_NOTE = "开发者日志页"
+APP_VERSION = "v1.0.20"
+APP_VERSION_NOTE = "成长日记可在线新增"
 
 # ========== 页面配置 ==========
 st.set_page_config(page_title="调单管理系统", layout="wide")
@@ -1308,6 +1309,28 @@ INTERNAL_RFI_TEMPLATES = {
 
 DEVELOPER_CHANGELOG = [
     {
+        "version": "v1.0.20",
+        "date": "2026-07-24",
+        "emoji": "✍️",
+        "title": "在线新增成长日志",
+        "tags": ["新功能"],
+        "items": [
+            "更新日志 Tab 可直接编写并发布新日志",
+            "自定义日志自动保存，刷新后仍可查看",
+        ],
+    },
+    {
+        "version": "v1.0.19",
+        "date": "2026-07-24",
+        "emoji": "💬",
+        "title": "留言板 + 文案更新",
+        "tags": ["新功能", "可爱"],
+        "items": [
+            "开发者日志改名为「小陈的成长日记」",
+            "新增留言板，可以留下想对小陈说的话",
+        ],
+    },
+    {
         "version": "v1.0.18",
         "date": "2026-07-24",
         "emoji": "📓",
@@ -1419,6 +1442,222 @@ DEVELOPER_CHANGELOG = [
     },
 ]
 
+CUSTOM_CHANGELOG_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else os.getcwd(),
+    "dev_custom_changelog.json",
+)
+
+def load_custom_changelog_from_file():
+    if not os.path.exists(CUSTOM_CHANGELOG_FILE):
+        return []
+    try:
+        with open(CUSTOM_CHANGELOG_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            return data
+    except Exception:
+        pass
+    return []
+
+def save_custom_changelog_to_file(entries):
+    try:
+        with open(CUSTOM_CHANGELOG_FILE, "w", encoding="utf-8") as f:
+            json.dump(entries, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception:
+        return False
+
+def init_custom_changelog():
+    if "dev_custom_changelog" not in st.session_state:
+        st.session_state["dev_custom_changelog"] = load_custom_changelog_from_file()
+
+def get_merged_changelog():
+    init_custom_changelog()
+    custom = st.session_state.get("dev_custom_changelog", [])
+    return custom + DEVELOPER_CHANGELOG
+
+def parse_changelog_tags(tags_text):
+    text = clean_import_str(tags_text)
+    if not text:
+        return []
+    for sep in ["，", ";", "；"]:
+        text = text.replace(sep, ",")
+    return [part.strip() for part in text.split(",") if part.strip()]
+
+def parse_changelog_items(items_text):
+    lines = []
+    for line in (items_text or "").splitlines():
+        line = line.strip().lstrip("-•* ").strip()
+        if line:
+            lines.append(line)
+    return lines
+
+def add_custom_changelog_entry(version, entry_date, emoji, title, tags_text, items_text):
+    title = clean_import_str(title)
+    items = parse_changelog_items(items_text)
+    if not title:
+        return False, "请填写日志标题"
+    if not items:
+        return False, "请至少写一条更新说明（每行一条）"
+    init_custom_changelog()
+    entry = {
+        "id": datetime.datetime.now().strftime("%Y%m%d%H%M%S%f"),
+        "version": clean_import_str(version) or APP_VERSION,
+        "date": str(entry_date) if entry_date else datetime.date.today().isoformat(),
+        "emoji": clean_import_str(emoji) or "✨",
+        "title": title,
+        "tags": parse_changelog_tags(tags_text) or ["自定义"],
+        "items": items,
+        "source": "custom",
+    }
+    st.session_state["dev_custom_changelog"].insert(0, entry)
+    saved = save_custom_changelog_to_file(st.session_state["dev_custom_changelog"])
+    if saved:
+        return True, "新日志已发布 ✨"
+    return True, "新日志已显示（本次会话有效，云端可能无法持久保存到文件）"
+
+def delete_custom_changelog_entry(entry_id):
+    init_custom_changelog()
+    before = len(st.session_state["dev_custom_changelog"])
+    st.session_state["dev_custom_changelog"] = [
+        e for e in st.session_state["dev_custom_changelog"] if e.get("id") != entry_id
+    ]
+    if len(st.session_state["dev_custom_changelog"]) == before:
+        return False, "未找到该日志"
+    save_custom_changelog_to_file(st.session_state["dev_custom_changelog"])
+    return True, "已删除"
+
+def render_add_changelog_form():
+    st.markdown("#### ✍️ 新增日志")
+    st.caption("自由编写新的成长记录，发布后立刻出现在下方时间线。")
+    with st.form("dev_add_changelog_form", clear_on_submit=True):
+        row1_col1, row1_col2, row1_col3 = st.columns([1, 1, 1])
+        with row1_col1:
+            log_version = st.text_input("版本号", value=APP_VERSION, placeholder="v1.0.21")
+        with row1_col2:
+            log_date = st.date_input("日期", value=datetime.date.today())
+        with row1_col3:
+            log_emoji = st.text_input("图标 emoji", value="✨", placeholder="✨")
+        log_title = st.text_input("标题", placeholder="这次更新做了什么？")
+        log_tags = st.text_input("标签", placeholder="新功能, 修复（逗号分隔）")
+        log_items = st.text_area(
+            "更新说明",
+            placeholder="每行一条，例如：\n优化导入速度\n修复筛选 bug",
+            height=120,
+        )
+        if st.form_submit_button("📝 发布日志", type="primary", use_container_width=True):
+            ok, msg = add_custom_changelog_entry(
+                log_version, log_date, log_emoji, log_title, log_tags, log_items
+            )
+            if ok:
+                st.success(msg)
+                st.rerun()
+            else:
+                st.warning(msg)
+
+GUESTBOOK_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else os.getcwd(),
+    "dev_guestbook.json",
+)
+
+def load_guestbook_from_file():
+    if not os.path.exists(GUESTBOOK_FILE):
+        return []
+    try:
+        with open(GUESTBOOK_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            return data
+    except Exception:
+        pass
+    return []
+
+def save_guestbook_to_file(messages):
+    try:
+        with open(GUESTBOOK_FILE, "w", encoding="utf-8") as f:
+            json.dump(messages, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception:
+        return False
+
+def init_dev_guestbook():
+    if "dev_guestbook" not in st.session_state:
+        st.session_state["dev_guestbook"] = load_guestbook_from_file()
+
+def add_dev_guestbook_message(author, content):
+    author = clean_import_str(author) or "匿名小伙伴"
+    content = clean_import_str(content)
+    if not content:
+        return False, "写点什么再发送吧～"
+    init_dev_guestbook()
+    entry = {
+        "id": datetime.datetime.now().strftime("%Y%m%d%H%M%S%f"),
+        "author": author,
+        "content": content,
+        "time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
+    }
+    st.session_state["dev_guestbook"].insert(0, entry)
+    st.session_state["dev_guestbook"] = st.session_state["dev_guestbook"][:100]
+    saved = save_guestbook_to_file(st.session_state["dev_guestbook"])
+    if saved:
+        return True, "留言已贴上留言板啦 🎀"
+    return True, "留言已显示（本次会话有效，云端可能无法持久保存到文件）"
+
+def render_dev_guestbook_section():
+    init_dev_guestbook()
+    messages = st.session_state.get("dev_guestbook", [])
+
+    st.markdown("""
+    <style>
+    .guestbook-card {
+        background: linear-gradient(135deg, #fffaf0 0%, #fff0f6 100%);
+        border: 1px solid #ffd6e0;
+        border-radius: 16px;
+        padding: 0.85rem 1rem;
+        margin-bottom: 0.65rem;
+    }
+    .guestbook-author { font-weight: 700; color: #9d4edd; font-size: 0.95rem; }
+    .guestbook-time { color: #b5838d; font-size: 0.78rem; margin-left: 0.5rem; }
+    .guestbook-content { color: #4a4e69; margin-top: 0.35rem; line-height: 1.5; white-space: pre-wrap; }
+    </style>
+    """, unsafe_allow_html=True)
+
+    st.caption("想对小陈说点什么？留下你的足迹吧～")
+
+    with st.form("dev_guestbook_form", clear_on_submit=True):
+        g_col1, g_col2 = st.columns([1, 3])
+        with g_col1:
+            guest_author = st.text_input("昵称", placeholder="匿名小伙伴")
+        with g_col2:
+            guest_content = st.text_area("留言", placeholder="今天用这个系统的感觉是…", height=90)
+        submitted = st.form_submit_button("📮 贴上留言板", type="primary", use_container_width=True)
+        if submitted:
+            ok, msg = add_dev_guestbook_message(guest_author, guest_content)
+            if ok:
+                st.success(msg)
+                st.rerun()
+            else:
+                st.warning(msg)
+
+    st.markdown(f"**已有 {len(messages)} 条留言**")
+    if not messages:
+        st.info("还没有留言，来做第一个吧 ✨")
+        return
+
+    for item in messages:
+        author = html_lib.escape(clean_import_str(item.get("author")) or "匿名小伙伴")
+        content = html_lib.escape(clean_import_str(item.get("content")))
+        time_text = html_lib.escape(clean_import_str(item.get("time")))
+        if not content:
+            continue
+        st.markdown(f"""
+        <div class="guestbook-card">
+            <span class="guestbook-author">🌷 {author}</span>
+            <span class="guestbook-time">{time_text}</span>
+            <div class="guestbook-content">{content}</div>
+        </div>
+        """, unsafe_allow_html=True)
+
 def render_developer_log_page():
     st.markdown("""
     <style>
@@ -1451,80 +1690,100 @@ def render_developer_log_page():
     }
     .dev-entry-title { font-weight: 700; color: #4a4e69; margin-bottom: 0.25rem; }
     .dev-entry-meta { color: #9a8c98; font-size: 0.85rem; margin-bottom: 0.5rem; }
-    .dev-footer {
-        text-align: center;
-        color: #b5838d;
-        padding: 1rem;
-        font-size: 0.9rem;
+    .dev-custom-badge {
+        display: inline-block;
+        background: #e0c3fc;
+        color: #5a189a;
+        border-radius: 999px;
+        padding: 0.1rem 0.55rem;
+        font-size: 0.72rem;
+        margin-left: 0.35rem;
+    }
+    .guestbook-section {
+        background: #fffbf7;
+        border: 2px dashed #c9b6ff;
+        border-radius: 20px;
+        padding: 1rem 1.2rem;
+        margin-top: 0.5rem;
     }
     </style>
     """, unsafe_allow_html=True)
 
     st.markdown(f"""
     <div class="dev-log-hero">
-        <h2>🐱 开发者日志 · Dev Diary</h2>
-        <p>嗨～这里是调单小助手的成长日记 ✨ 当前版本 <b>{APP_VERSION}</b>，每一条都是我们一起打磨的痕迹。</p>
+        <h2>🐱 小陈的成长日记 · Dev Diary</h2>
+        <p>欢迎来到小陈的成长日记 ✨ 当前版本 <b>{APP_VERSION}</b>，每一条都是打磨的痕迹。</p>
     </div>
     """, unsafe_allow_html=True)
 
+    all_logs = get_merged_changelog()
     col_a, col_b, col_c = st.columns(3)
     with col_a:
-        st.metric("📝 日志条数", f"{len(DEVELOPER_CHANGELOG)}")
+        st.metric("📝 日志条数", f"{len(all_logs)}")
     with col_b:
-        st.metric("🚀 最新版本", DEVELOPER_CHANGELOG[0]["version"])
+        st.metric("🚀 最新版本", all_logs[0]["version"] if all_logs else APP_VERSION)
     with col_c:
-        st.metric("🎀 最新更新", DEVELOPER_CHANGELOG[0]["date"])
+        init_dev_guestbook()
+        st.metric("💬 留言数", f"{len(st.session_state.get('dev_guestbook', []))}")
 
-    st.markdown("---")
-    filter_tag = st.multiselect(
-        "🏷️ 按标签筛选",
-        sorted({tag for entry in DEVELOPER_CHANGELOG for tag in entry.get("tags", [])}),
-        default=[],
-        placeholder="不选则显示全部",
-    )
+    log_tab, guest_tab = st.tabs(["📜 更新日志", "💬 留言板"])
 
-    shown = 0
-    for entry in DEVELOPER_CHANGELOG:
-        tags = entry.get("tags", [])
-        if filter_tag and not any(t in filter_tag for t in tags):
-            continue
-        shown += 1
-        tag_html = "".join(f'<span class="dev-tag">{t}</span>' for t in tags)
-        items_html = "".join(f"<li>{item}</li>" for item in entry["items"])
-        with st.container(border=True):
-            st.markdown(f"""
-            <div class="dev-entry-card">
-                <div class="dev-entry-title">{entry["emoji"]} {entry["version"]} · {entry["title"]}</div>
-                <div class="dev-entry-meta">📅 {entry["date"]}</div>
-                <div>{tag_html}</div>
-                <ul style="margin: 0.5rem 0 0 1.1rem; color: #4a4e69;">{items_html}</ul>
-            </div>
-            """, unsafe_allow_html=True)
+    with log_tab:
+        render_add_changelog_form()
+        st.markdown("---")
+        filter_tag = st.multiselect(
+            "🏷️ 按标签筛选",
+            sorted({tag for entry in all_logs for tag in entry.get("tags", [])}),
+            default=[],
+            placeholder="不选则显示全部",
+            key="dev_log_filter",
+        )
 
-    if shown == 0:
-        st.info("没有符合筛选条件的日志，换个标签试试～")
+        shown = 0
+        for entry in all_logs:
+            tags = entry.get("tags", [])
+            if filter_tag and not any(t in filter_tag for t in tags):
+                continue
+            shown += 1
+            tag_html = "".join(f'<span class="dev-tag">{t}</span>' for t in tags)
+            items_html = "".join(
+                f"<li>{html_lib.escape(str(item))}</li>" for item in entry.get("items", [])
+            )
+            title = html_lib.escape(str(entry.get("title", "")))
+            version = html_lib.escape(str(entry.get("version", "")))
+            emoji = html_lib.escape(str(entry.get("emoji", "✨")))
+            date_text = html_lib.escape(str(entry.get("date", "")))
+            custom_badge = '<span class="dev-custom-badge">自定义</span>' if entry.get("source") == "custom" else ""
+            with st.container(border=True):
+                st.markdown(f"""
+                <div class="dev-entry-card">
+                    <div class="dev-entry-title">{emoji} {version} · {title}{custom_badge}</div>
+                    <div class="dev-entry-meta">📅 {date_text}</div>
+                    <div>{tag_html}</div>
+                    <ul style="margin: 0.5rem 0 0 1.1rem; color: #4a4e69;">{items_html}</ul>
+                </div>
+                """, unsafe_allow_html=True)
+                if entry.get("source") == "custom" and entry.get("id"):
+                    if st.button("🗑️ 删除此条", key=f"del_changelog_{entry['id']}"):
+                        ok, msg = delete_custom_changelog_entry(entry["id"])
+                        if ok:
+                            st.success(msg)
+                            st.rerun()
+                        else:
+                            st.error(msg)
 
-    st.markdown("""
-    <div class="dev-footer">
-        🌸 Built with Streamlit + Supabase · 有问题随时在迭代里加一条新日志吧～
-    </div>
-    """, unsafe_allow_html=True)
+        if shown == 0:
+            st.info("没有符合筛选条件的日志，换个标签试试～")
 
-    with st.expander("🛠️ 给开发者的小纸条"):
-        st.caption("想加新日志？在 app.py 的 `DEVELOPER_CHANGELOG` 列表最前面插入一条即可。")
-        st.code('''{
-    "version": "v1.0.xx",
-    "date": "2026-xx-xx",
-    "emoji": "✨",
-    "title": "功能标题",
-    "tags": ["标签"],
-    "items": ["更新说明 1", "更新说明 2"],
-}''', language="json")
+    with guest_tab:
+        st.markdown('<div class="guestbook-section">', unsafe_allow_html=True)
+        render_dev_guestbook_section()
+        st.markdown('</div>', unsafe_allow_html=True)
 
 # ========== 侧边栏导航 ==========
 page = st.sidebar.radio(
     "📌 功能导航",
-    ["📊 调单看板", "📝 登记调单", "📤 导入历史数据", "📄 查看全部数据", "📧 回复渠道调单", "📨 对客RFI", "🐱 开发者日志"]
+    ["📊 调单看板", "📝 登记调单", "📤 导入历史数据", "📄 查看全部数据", "📧 回复渠道调单", "📨 对客RFI", "🐱 小陈的成长日记"]
 )
 
 # ============================================================
@@ -2243,7 +2502,7 @@ elif page == "📨 对客RFI":
             st.info("💡 已恢复之前保存的草稿")
 
 # ============================================================
-# PAGE 7: 开发者日志
+# PAGE 7: 小陈的成长日记
 # ============================================================
-elif page == "🐱 开发者日志":
+elif page == "🐱 小陈的成长日记":
     render_developer_log_page()
