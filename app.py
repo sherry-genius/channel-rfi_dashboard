@@ -512,13 +512,29 @@ def read_uploaded_excel(file_obj, sheet_name):
         errors.append(f"xmlzip: {exc}")
     raise RuntimeError("无法读取 Excel 数据：\n" + "\n".join(errors))
 
-def prepare_import_dataframe(df_raw, col_map, col_names):
+def resolve_excel_column(name, all_cols):
+    name = clean_import_str(name)
+    if not name:
+        return None, None
+    if name in all_cols:
+        return name, None
+    lower_map = {str(c).lower().strip(): c for c in all_cols}
+    matched = lower_map.get(name.lower())
+    if matched:
+        return matched, f"已匹配到列：{matched}"
+    return None, f"Excel 中找不到列「{name}」，请检查拼写或从下拉列表选择"
+
+def prepare_import_dataframe(df_raw, col_map, col_names, fixed_values=None):
+    fixed_values = fixed_values or {}
     df_std = pd.DataFrame()
     for std_col, excel_col in col_map.items():
         df_std[std_col] = df_raw[excel_col].values
     for col in col_names:
         if col not in df_std.columns:
-            df_std[col] = None
+            if col in fixed_values:
+                df_std[col] = fixed_values[col]
+            else:
+                df_std[col] = None
     df_std["收件日期"] = df_std["收件日期"].apply(format_import_date)
     df_std["金额"] = df_std["金额"].apply(clean_import_amount)
     df_std = df_std.fillna({
@@ -769,11 +785,11 @@ def apply_all_data_filters(df, range_start, range_end, selected_biz, selected_ty
         date_col = pd.to_datetime(filtered["收件日期"], errors="coerce")
         filtered = filtered[date_col.notna() & (date_col.dt.date >= range_start) & (date_col.dt.date <= range_end)]
     if selected_biz != "全部":
-        filtered = filtered[filtered["业务线"] == selected_biz]
+        filtered = filtered[filtered["业务线"].fillna("").astype(str).str.strip() == selected_biz.strip()]
     if selected_type != "全部":
-        filtered = filtered[filtered["调单类型"] == selected_type]
+        filtered = filtered[filtered["调单类型"].fillna("").astype(str).str.strip() == selected_type.strip()]
     if selected_channel != "全部":
-        filtered = filtered[filtered["渠道"].astype(str).str.strip() == selected_channel]
+        filtered = filtered[filtered["渠道"].fillna("").astype(str).str.strip() == selected_channel.strip()]
     keyword = keyword.strip()
     if keyword:
         kw = keyword.lower()
@@ -784,6 +800,9 @@ def apply_all_data_filters(df, range_start, range_end, selected_biz, selected_ty
                 mask = mask | filtered[col].fillna("").astype(str).str.lower().str.contains(kw, regex=False)
         filtered = filtered[mask]
     return filtered
+
+def count_by_filters(df, range_start, range_end, selected_biz, selected_type, selected_channel, keyword):
+    return len(apply_all_data_filters(df, range_start, range_end, selected_biz, selected_type, selected_channel, keyword))
 
 def build_monthly_count_with_mom_chart(trend_df):
     import altair as alt
@@ -1149,6 +1168,7 @@ elif page == "📤 导入历史数据":
             st.write("**原始列名：**", df_import.columns.tolist())
             st.dataframe(df_import.head(5), use_container_width=True)
             st.subheader("🔧 列名映射（如果自动识别失败，请手动选择）")
+            st.caption("可从下拉选择 Excel 列、手动输入列名，或填写固定值（所有行相同）")
             all_cols = df_import.columns.tolist()
             auto_map = {}
             for col in all_cols:
@@ -1178,6 +1198,8 @@ elif page == "📤 导入历史数据":
                 elif '邮件标题' in col:
                     auto_map['邮件标题'] = col
             col_map = {}
+            fixed_values = {}
+            mapping_errors = []
             col_names = ["商户ID", "商户名称", "调单类型", "收件日期", "金额", "币种", "业务线", "渠道", "邮件标题"]
             col_help = {
                 "商户ID": "选填，如：5181241025033620258",
@@ -1195,20 +1217,49 @@ elif page == "📤 导入历史数据":
                 if col_name in auto_map and auto_map[col_name] in all_cols:
                     default_index = all_cols.index(auto_map[col_name]) + 1
                 options = ["（跳过此列）"] + all_cols
-                selected = st.selectbox(
-                    f"**{col_name}** - {col_help[col_name]}",
-                    options,
-                    index=default_index,
-                    key=f"import_map_{col_name}",
-                )
-                if selected != "（跳过此列）":
+                st.markdown(f"**{col_name}** - {col_help[col_name]}")
+                map_col1, map_col2, map_col3 = st.columns([2, 1.2, 1.2])
+                with map_col1:
+                    selected = st.selectbox(
+                        "从 Excel 列选择",
+                        options,
+                        index=default_index,
+                        key=f"import_map_{col_name}",
+                        label_visibility="collapsed",
+                    )
+                with map_col2:
+                    manual_col = st.text_input(
+                        "手动输入 Excel 列名",
+                        placeholder="输入列名",
+                        key=f"import_map_manual_{col_name}",
+                    )
+                with map_col3:
+                    fixed_val = st.text_input(
+                        "固定值（全体相同）",
+                        placeholder="如：Recall",
+                        key=f"import_map_fixed_{col_name}",
+                    )
+                if fixed_val.strip():
+                    fixed_values[col_name] = fixed_val.strip()
+                elif manual_col.strip():
+                    resolved, hint = resolve_excel_column(manual_col, all_cols)
+                    if resolved:
+                        col_map[col_name] = resolved
+                        if hint:
+                            st.caption(hint)
+                    else:
+                        mapping_errors.append(f"{col_name}：{hint}")
+                elif selected != "（跳过此列）":
                     col_map[col_name] = selected
             required_cols = []
-            missing = [c for c in required_cols if c not in col_map]
-            if missing:
+            missing = [c for c in required_cols if c not in col_map and c not in fixed_values]
+            if mapping_errors:
+                for msg in mapping_errors:
+                    st.error(msg)
+            elif missing:
                 st.error(f"⚠️ 请为以下必填列选择对应的Excel列：{missing}")
             else:
-                df_import = prepare_import_dataframe(df_import, col_map, col_names)
+                df_import = prepare_import_dataframe(df_import, col_map, col_names, fixed_values)
                 st.success(f"✅ 列名映射完成！共 {len(df_import)} 行数据准备导入")
                 st.caption("💡 若 Excel 中没有 Recall 类型列，可将「业务线」映射到「调单类型」；系统会自动识别并修正。")
                 preview_df = df_import.copy()
@@ -1277,10 +1328,8 @@ elif page == "📄 查看全部数据":
                 data_max = valid_dates.max().date()
             else:
                 data_min = data_max = today
+            default_start = data_min
             default_end = data_max
-            default_start = default_end.replace(day=1)
-            if default_start < data_min:
-                default_start = data_min
 
             st.subheader("🔎 筛选搜索")
             fcol1, fcol2, fcol3, fcol4 = st.columns(4)
@@ -1297,7 +1346,7 @@ elif page == "📄 查看全部数据":
                 biz_list = ["全部"] + sorted(work_df["业务线"].dropna().astype(str).str.strip().replace("", pd.NA).dropna().unique().tolist())
                 selected_biz = st.selectbox("业务线", biz_list, key="all_data_biz")
             with fcol3:
-                type_list = ["全部"] + sorted(work_df["调单类型"].dropna().astype(str).unique().tolist())
+                type_list = ["全部"] + sorted(work_df["调单类型"].dropna().astype(str).str.strip().replace("", pd.NA).dropna().unique().tolist())
                 selected_type = st.selectbox("调单类型", type_list, key="all_data_type")
             with fcol4:
                 channel_list = ["全部"] + sorted(work_df["渠道"].dropna().astype(str).str.strip().replace("", pd.NA).dropna().unique().tolist())
@@ -1313,6 +1362,10 @@ elif page == "📄 查看全部数据":
             st.write(f"筛选结果：**{len(filtered_df)}** / {len(work_df)} 条")
             if len(filtered_df) == 0:
                 st.warning("没有符合筛选条件的数据，请调整筛选条件")
+                if selected_type != "全部":
+                    full_type_count = count_by_filters(work_df, data_min, data_max, "全部", selected_type, "全部", "")
+                    if full_type_count > 0:
+                        st.info(f"提示：调单类型「{selected_type}」在全量日期范围内共有 **{full_type_count}** 条，请将「收件日期」扩大到 {data_min} ~ {data_max}")
                 st.stop()
             st.info("💡 可直接在下方表格中修改数据，修改完成后点击「保存修改」写入数据库")
             type_options = sorted(set(STAT_TYPE_OPTIONS) | set(work_df['调单类型'].dropna().astype(str)))
