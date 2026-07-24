@@ -763,6 +763,30 @@ def build_biz_type_summary(df):
     pivot[num_cols] = pivot[num_cols].astype(int)
     return pivot
 
+def build_monthly_count_with_mom_chart(trend_df):
+    import altair as alt
+    data = trend_df.copy().sort_values("收件日期").reset_index(drop=True)
+    data["环比%"] = data["笔数"].pct_change() * 100
+    x_sort = data["收件日期"].tolist()
+    x_enc = alt.X("收件日期:N", sort=x_sort, title="月份", axis=alt.Axis(labelAngle=-45))
+    bars = alt.Chart(data).mark_bar(color="#5470C6", opacity=0.85).encode(
+        x=x_enc,
+        y=alt.Y("笔数:Q", title="调单笔数"),
+        tooltip=[
+            alt.Tooltip("收件日期:N", title="月份"),
+            alt.Tooltip("笔数:Q", title="笔数", format=","),
+        ],
+    )
+    line = alt.Chart(data.dropna(subset=["环比%"])).mark_line(color="#EE6666", point=alt.OverlayMarkDef(filled=True, size=60)).encode(
+        x=x_enc,
+        y=alt.Y("环比%:Q", title="环比 (%)", axis=alt.Axis(format="+.1f", orient="right")),
+        tooltip=[
+            alt.Tooltip("收件日期:N", title="月份"),
+            alt.Tooltip("环比%:Q", title="较上月环比", format="+.1f"),
+        ],
+    )
+    return alt.layer(bars, line).resolve_scale(y="independent").properties(height=340)
+
 def format_month_day(d):
     return f"{d.month}月{d.day}日"
 
@@ -955,8 +979,25 @@ if page == "📊 调单看板":
         with col_left:
             st.subheader("每月调单笔数")
             trend = filtered.groupby(filtered['收件日期'].dt.strftime('%Y年%m月')).size().reset_index(name='笔数')
+            trend.columns = ['收件日期', '笔数']
             if len(trend) > 0:
-                st.bar_chart(trend.set_index('收件日期'))
+                try:
+                    st.altair_chart(build_monthly_count_with_mom_chart(trend), use_container_width=True)
+                    st.caption("柱状图：每月笔数｜折线：较上月环比 %（右轴）")
+                except ImportError:
+                    import matplotlib.pyplot as plt
+                    trend_sorted = trend.sort_values("收件日期").reset_index(drop=True)
+                    trend_sorted["环比%"] = trend_sorted["笔数"].pct_change() * 100
+                    fig, ax1 = plt.subplots(figsize=(8, 4))
+                    ax1.bar(trend_sorted["收件日期"], trend_sorted["笔数"], color="#5470C6", alpha=0.85)
+                    ax1.set_ylabel("调单笔数")
+                    ax1.tick_params(axis="x", rotation=45)
+                    ax2 = ax1.twinx()
+                    ax2.plot(trend_sorted["收件日期"], trend_sorted["环比%"], color="#EE6666", marker="o")
+                    ax2.set_ylabel("环比 (%)")
+                    ax2.axhline(0, color="#999999", linewidth=0.8, linestyle="--")
+                    fig.tight_layout()
+                    st.pyplot(fig)
         with col_right:
             st.subheader("每月调单金额 (USD)")
             amount_trend = filtered.groupby(filtered['收件日期'].dt.strftime('%Y年%m月'))['金额_USD'].sum().reset_index(name='金额(USD)')
