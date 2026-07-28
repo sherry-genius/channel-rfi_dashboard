@@ -831,7 +831,7 @@ def get_email_sync_config():
         "username": "",
         "password": "",
         "folder": "INBOX",
-        "days": 14,
+        "days": 1,
         "keyword": "",
         "auto_sync_on_open": False,
     }
@@ -841,7 +841,7 @@ def get_email_sync_config():
         merged.update({k: cfg.get(k, v) for k, v in defaults.items()})
         merged["enabled"] = bool(cfg.get("enabled", merged["username"] and merged["password"]))
         merged["imap_port"] = int(merged.get("imap_port") or 993)
-        merged["days"] = int(merged.get("days") or 14)
+        merged["days"] = int(merged.get("days") or 1)
         merged["auto_sync_on_open"] = bool(cfg.get("auto_sync_on_open", False))
         return merged
     except Exception:
@@ -1185,7 +1185,7 @@ def sync_emails_from_imap(config=None):
             "skip_count": 0,
             "fail_count": 0,
         }
-    keyword = clean_import_str(config.get("keyword")).lower()
+    today = datetime.date.today()
     existing_df = load_all_data()
     existing_message_ids = collect_existing_email_message_ids(existing_df)
     existing_message_ids |= collect_inbox_message_ids()
@@ -1201,13 +1201,12 @@ def sync_emails_from_imap(config=None):
         status, _ = mail.select(folder)
         if status != "OK":
             return {"ok": False, "error": f"无法打开邮箱文件夹：{folder}", "new_count": 0, "skip_count": 0, "fail_count": 0}
-        since_date = datetime.date.today() - datetime.timedelta(days=int(config.get("days") or 14))
+        since_date = today
         search_criteria = f'(SINCE {since_date.strftime("%d-%b-%Y")})'
         status, data = mail.search(None, search_criteria)
         if status != "OK":
             return {"ok": False, "error": "邮箱搜索失败", "new_count": 0, "skip_count": 0, "fail_count": 0}
         ids = data[0].split()
-        ids = ids[-100:]
         for num in reversed(ids):
             try:
                 status, msg_data = mail.fetch(num, "(RFC822)")
@@ -1219,8 +1218,14 @@ def sync_emails_from_imap(config=None):
                 if message_id in existing_message_ids:
                     skip_count += 1
                     continue
-                subject = decode_mime_words(msg.get("Subject")) or ""
-                if keyword and keyword not in subject.lower():
+                receive_dt = parsedate_to_datetime(msg.get("Date")) if msg.get("Date") else datetime.datetime.now()
+                if isinstance(receive_dt, datetime.datetime):
+                    if receive_dt.tzinfo is not None:
+                        receive_dt = receive_dt.astimezone().replace(tzinfo=None)
+                    msg_date = receive_dt.date()
+                else:
+                    msg_date = today
+                if msg_date != today:
                     skip_count += 1
                     continue
                 fetched_items.append(build_email_inbox_item(msg, message_id))
@@ -2381,7 +2386,7 @@ def render_developer_log_page():
 def render_email_status_panel():
     email_cfg = get_email_sync_config()
     with st.expander("⚙️ 邮箱同步配置", expanded=False):
-        st.caption("邮件仅拉取到本页待办，不会自动写入全部数据；登记后才会入库。")
+        st.caption("同步邮箱将拉取当天收到的全部邮件到本页待办，不会自动写入全部数据；登记后才会入库。")
         st.markdown("""
 ```toml
 [email_sync]
@@ -2391,8 +2396,6 @@ imap_port = 993
 username = "your.name@company.com"
 password = "邮箱授权码"
 folder = "INBOX"
-days = 14
-keyword = "RFI"
 auto_sync_on_open = true
 ```
         """)
