@@ -859,31 +859,63 @@ def decode_mime_words(value):
             chunks.append(str(text))
     return "".join(chunks).strip()
 
+def _decode_email_part(part):
+    payload = part.get_payload(decode=True)
+    if not payload:
+        return ""
+    charset = part.get_content_charset() or "utf-8"
+    return payload.decode(charset, errors="ignore")
+
+def html_email_to_plain(html_text):
+    text = html_text or ""
+    text = re.sub(r"(?i)<br\s*/?>", "\n", text)
+    for tag in ("p", "div", "tr", "li", "h1", "h2", "h3", "h4", "h5", "h6", "table", "blockquote"):
+        text = re.sub(rf"(?i)</{tag}>", "\n", text)
+        text = re.sub(rf"(?i)<{tag}[^>]*>", "\n", text)
+    text = re.sub(r"<[^>]+>", "", text)
+    return html_lib.unescape(text)
+
+def normalize_email_body_text(text):
+    if not text:
+        return ""
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = html_lib.unescape(text)
+    lines = [line.rstrip() for line in text.split("\n")]
+    text = "\n".join(lines)
+    text = re.sub(r"\n{4,}", "\n\n\n", text)
+    return text.strip("\n").strip()
+
 def extract_email_text_body(msg, max_len=800):
-    chunks = []
+    plain_parts = []
+    html_parts = []
     if msg.is_multipart():
         for part in msg.walk():
             content_type = part.get_content_type()
             disposition = str(part.get("Content-Disposition") or "").lower()
             if "attachment" in disposition:
                 continue
-            if content_type not in ("text/plain", "text/html"):
-                continue
-            payload = part.get_payload(decode=True)
-            if not payload:
-                continue
-            charset = part.get_content_charset() or "utf-8"
-            chunks.append(payload.decode(charset, errors="ignore"))
-            if sum(len(x) for x in chunks) >= max_len:
-                break
+            if content_type == "text/plain":
+                decoded = _decode_email_part(part)
+                if decoded:
+                    plain_parts.append(decoded)
+            elif content_type == "text/html":
+                decoded = _decode_email_part(part)
+                if decoded:
+                    html_parts.append(decoded)
     else:
-        payload = msg.get_payload(decode=True)
-        if payload:
-            charset = msg.get_content_charset() or "utf-8"
-            chunks.append(payload.decode(charset, errors="ignore"))
-    text = "\n".join(chunks)
-    text = re.sub(r"<[^>]+>", " ", text)
-    text = re.sub(r"\s+", " ", text).strip()
+        decoded = _decode_email_part(msg)
+        if decoded:
+            if msg.get_content_type() == "text/html":
+                html_parts.append(decoded)
+            else:
+                plain_parts.append(decoded)
+    if plain_parts:
+        text = max(plain_parts, key=len)
+    elif html_parts:
+        text = html_email_to_plain(max(html_parts, key=len))
+    else:
+        text = ""
+    text = normalize_email_body_text(text)
     return text[:max_len]
 
 def infer_channel_from_email(from_addr, subject=""):
@@ -2431,6 +2463,12 @@ def render_email_status_panel():
     .inbox-email-card-meta .meta-row:last-child {
         margin-bottom: 0;
     }
+    div[data-testid="stTextArea"] textarea[disabled] {
+        white-space: pre-wrap !important;
+        line-height: 1.65 !important;
+        word-break: break-word;
+        overflow-wrap: anywhere;
+    }
     </style>
     """, unsafe_allow_html=True)
     with st.expander("⚙️ 邮箱同步配置", expanded=False):
@@ -2535,7 +2573,7 @@ auto_sync_on_open = true
             st.text_area(
                 "邮件内容",
                 value=item.get("邮件内容", ""),
-                height=120,
+                height=180,
                 disabled=True,
                 key=inbox_widget_key(message_id, "email_body"),
                 label_visibility="collapsed",
