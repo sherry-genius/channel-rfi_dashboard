@@ -1056,23 +1056,45 @@ def collect_inbox_message_ids(items=None):
     items = items if items is not None else get_email_inbox_items()
     return {clean_import_str(item.get("message_id")) for item in items if clean_import_str(item.get("message_id"))}
 
+def format_inbox_receive_time(item):
+    receive_time = clean_import_str(item.get("收件时间"))
+    if receive_time:
+        return receive_time
+    receive_date = clean_import_str(item.get("收件日期"))
+    if not receive_date:
+        return ""
+    try:
+        dt = pd.to_datetime(receive_date)
+        if " " not in receive_date and dt.hour == 0 and dt.minute == 0 and dt.second == 0:
+            return dt.strftime("%Y-%m-%d")
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return receive_date
+
 def build_email_inbox_item(msg, message_id):
     subject = decode_mime_words(msg.get("Subject")) or "（无主题）"
     from_raw = decode_mime_words(msg.get("From"))
     _, from_addr = parseaddr(from_raw)
     from_addr = clean_import_str(from_addr) or from_raw
+    from_display = clean_import_str(from_raw) or from_addr
     receive_dt = parsedate_to_datetime(msg.get("Date")) if msg.get("Date") else datetime.datetime.now()
     if isinstance(receive_dt, datetime.datetime):
+        if receive_dt.tzinfo is not None:
+            receive_dt = receive_dt.astimezone().replace(tzinfo=None)
         receive_date = receive_dt.date().isoformat()
+        receive_time = receive_dt.strftime("%Y-%m-%d %H:%M:%S")
     else:
-        receive_date = datetime.date.today().isoformat()
+        now = datetime.datetime.now()
+        receive_date = now.date().isoformat()
+        receive_time = now.strftime("%Y-%m-%d %H:%M:%S")
     body_snippet = extract_email_text_body(msg, max_len=2000)
     return {
         "message_id": message_id,
         "收件日期": receive_date,
+        "收件时间": receive_time,
         "邮件标题": subject,
         "邮件内容": body_snippet,
-        "发件人": from_addr,
+        "发件人": from_display,
         "调单状态": "待处理",
         "调单类型": infer_order_type_from_subject(subject),
         "渠道": infer_channel_from_email(from_addr, subject),
@@ -2385,6 +2407,32 @@ def render_developer_log_page():
 
 def render_email_status_panel():
     email_cfg = get_email_sync_config()
+    st.markdown("""
+    <style>
+    .inbox-email-card-title {
+        margin: 0 0 0.45rem;
+        line-height: 1.5;
+        word-break: break-word;
+        overflow-wrap: anywhere;
+    }
+    .inbox-email-card-meta {
+        margin: 0 0 0.75rem;
+        line-height: 1.7;
+        color: #5c5c5c;
+        font-size: 0.92rem;
+    }
+    .inbox-email-card-meta .meta-row {
+        display: block;
+        margin-bottom: 0.4rem;
+        word-break: break-word;
+        overflow-wrap: anywhere;
+        white-space: normal;
+    }
+    .inbox-email-card-meta .meta-row:last-child {
+        margin-bottom: 0;
+    }
+    </style>
+    """, unsafe_allow_html=True)
     with st.expander("⚙️ 邮箱同步配置", expanded=False):
         st.caption("同步邮箱将拉取当天收到的全部邮件到本页待办，不会自动写入全部数据；登记后才会入库。")
         st.markdown("""
@@ -2453,12 +2501,17 @@ auto_sync_on_open = true
     for item in filtered:
         message_id = clean_import_str(item.get("message_id"))
         is_selected = message_id and message_id == selected_message_id
+        title = item.get("邮件标题", "（无主题）")
+        sender = item.get("发件人", "")
+        receive_time = format_inbox_receive_time(item)
         with st.container(border=True):
-            head_col, status_col = st.columns([3.2, 1.3])
-            with head_col:
+            title_col, status_col = st.columns([5, 1.2])
+            with title_col:
                 prefix = "✅ " if is_selected else ""
-                st.markdown(f"{prefix}**{item.get('邮件标题', '（无主题）')}**")
-                st.caption(f"{item.get('发件人', '')} · {item.get('收件日期', '')}")
+                st.markdown(
+                    f'<div class="inbox-email-card-title">{prefix}<strong>{html_lib.escape(title)}</strong></div>',
+                    unsafe_allow_html=True,
+                )
             with status_col:
                 status_key = inbox_widget_key(message_id, "email_status")
                 current_status = item.get("调单状态", "待处理")
@@ -2470,10 +2523,19 @@ auto_sync_on_open = true
                     key=status_key,
                     label_visibility="collapsed",
                 )
+            st.markdown(
+                f"""
+                <div class="inbox-email-card-meta">
+                    <span class="meta-row"><strong>发件人：</strong>{html_lib.escape(sender)}</span>
+                    <span class="meta-row"><strong>收件时间：</strong>{html_lib.escape(receive_time)}</span>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
             st.text_area(
                 "邮件内容",
                 value=item.get("邮件内容", ""),
-                height=100,
+                height=120,
                 disabled=True,
                 key=inbox_widget_key(message_id, "email_body"),
                 label_visibility="collapsed",
