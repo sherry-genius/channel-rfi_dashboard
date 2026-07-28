@@ -11,6 +11,7 @@ import urllib.request
 import urllib.parse
 import html as html_lib
 import imaplib
+import hashlib
 import email as email_lib
 from email.header import decode_header
 from email.utils import parsedate_to_datetime, parseaddr
@@ -33,10 +34,13 @@ CONTENT_CATEGORIES = ["", "KYC问询", "单笔交易问询", "账户调查", "�
 TRANSACTION_TYPE_OPTIONS = ["入账", "出款"]
 TRANSACTION_STATUS_OPTIONS = ["已到账", "未到账", "渠道退款", "商户退款"]
 DIAODAN_STATUS_OPTIONS = ["待处理", "处理中", "已回复", "已结案"]
+HANDLER_OPTIONS = ["A", "B", "C", "D"]
+SALES_OPTIONS = ["A", "B", "C", "D"]
+RECALL_TYPE_OPTIONS = ["欺诈召回", "召回"]
 
 # ========== 版本信息 ==========
-APP_VERSION = "v1.0.23"
-APP_VERSION_NOTE = "调单登记与处理合并页"
+APP_VERSION = "v1.0.24"
+APP_VERSION_NOTE = "邮箱拉取不入库，点邮件预填登记"
 
 # ========== 页面配置 ==========
 st.set_page_config(page_title="调单管理系统", layout="wide")
@@ -57,6 +61,7 @@ except Exception as e:
 APP_DATA_FIELDS = [
     "收件日期", "商户ID", "商户名称", "调单类型", "金额", "币种",
     "业务线", "渠道", "邮件标题", "调单内容分类", "调单内容详情", "登记时间",
+    "处理人", "所属销售", "截止日期", "VA",
 ]
 FIELD_ALIASES = {
     "收件日期": ["收件日期", "receive_date", "received_date", "date"],
@@ -71,6 +76,10 @@ FIELD_ALIASES = {
     "调单内容分类": ["调单内容分类", "content_category", "content_type"],
     "调单内容详情": ["调单内容详情", "content_detail", "content_details", "details"],
     "登记时间": ["登记时间", "created_at", "register_time", "registration_time"],
+    "处理人": ["处理人", "handler", "assignee"],
+    "所属销售": ["所属销售", "sales", "sales_owner"],
+    "截止日期": ["截止日期", "due_date", "deadline"],
+    "VA": ["VA", "va", "va_account"],
 }
 SUPABASE_ALTER_SQL = """
 -- 在 Supabase → SQL Editor 中运行，为 diaodan 表补全中文字段
@@ -86,6 +95,10 @@ ALTER TABLE diaodan ADD COLUMN IF NOT EXISTS "邮件标题" TEXT;
 ALTER TABLE diaodan ADD COLUMN IF NOT EXISTS "调单内容分类" TEXT;
 ALTER TABLE diaodan ADD COLUMN IF NOT EXISTS "调单内容详情" TEXT;
 ALTER TABLE diaodan ADD COLUMN IF NOT EXISTS "登记时间" TEXT;
+ALTER TABLE diaodan ADD COLUMN IF NOT EXISTS "处理人" TEXT;
+ALTER TABLE diaodan ADD COLUMN IF NOT EXISTS "所属销售" TEXT;
+ALTER TABLE diaodan ADD COLUMN IF NOT EXISTS "截止日期" TEXT;
+ALTER TABLE diaodan ADD COLUMN IF NOT EXISTS "VA" TEXT;
 """.strip()
 
 SUPABASE_CREATE_SQL = """
@@ -103,7 +116,11 @@ CREATE TABLE IF NOT EXISTS public.diaodan (
     "邮件标题" TEXT,
     "调单内容分类" TEXT,
     "调单内容详情" TEXT,
-    "登记时间" TEXT
+    "登记时间" TEXT,
+    "处理人" TEXT,
+    "所属销售" TEXT,
+    "截止日期" TEXT,
+    "VA" TEXT
 );
 
 ALTER TABLE public.diaodan ENABLE ROW LEVEL SECURITY;
@@ -319,7 +336,10 @@ def load_all_data():
         st.error(f"读取数据失败：{e}")
         return pd.DataFrame()
 
-def save_data(收件日期, 商户ID, 商户名称, 调单类型, 金额, 币种, 业务线, 渠道, 邮件标题, 调单内容分类="", 调单内容详情=""):
+def save_data(
+    收件日期, 商户ID, 商户名称, 调单类型, 金额, 币种, 业务线, 渠道, 邮件标题,
+    调单内容分类="", 调单内容详情="", 处理人="", 所属销售="", 截止日期="", VA="",
+):
     try:
         data = to_db_record({
             "收件日期": str(收件日期),
@@ -334,6 +354,10 @@ def save_data(收件日期, 商户ID, 商户名称, 调单类型, 金额, 币种
             "调单内容分类": str(调单内容分类),
             "调单内容详情": str(调单内容详情),
             "登记时间": datetime.datetime.now().isoformat(),
+            "处理人": str(处理人),
+            "所属销售": str(所属销售),
+            "截止日期": str(截止日期) if 截止日期 else "",
+            "VA": str(VA),
         })
         if not data:
             st.error("保存失败：没有可写入的数据。")
@@ -890,6 +914,233 @@ def infer_order_type_from_subject(subject):
         return "Personal Information"
     return "Retrieval Request"
 
+def infer_content_category_from_text(subject, body=""):
+    text = f"{subject} {body}".lower()
+    if "recall" in text:
+        return "Recall"
+    if any(k in text for k in ("kyc", "know your customer", "due diligence", "cdd")):
+        return "KYC问询"
+    if any(k in text for k in ("transaction", "payment", "transfer", "汇款", "收款", "remittance")):
+        return "单笔交易问询"
+    if any(k in text for k in ("account investigation", "account review", "账户调查", "账户问询")):
+        return "账户调查"
+    if any(k in text for k in ("结汇", "fx settlement", "foreign exchange settlement")):
+        return "结汇"
+    if any(k in text for k in ("police", "law enforcement", "警方", "协查")):
+        return "警方协查"
+    return ""
+
+def infer_merchant_id_from_text(text):
+    if not text:
+        return ""
+    patterns = [
+        r"(?i)merchant\s*(?:id|no|number|#)?[\s:：\-]*(\d{10,22})",
+        r"商户\s*(?:ID|编号|号)?[\s:：\-]*(\d{10,22})",
+        r"(?<![\d.])(\d{15,22})(?![\d.])",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match:
+            return match.group(1)
+    return ""
+
+def infer_merchant_name_from_text(text):
+    if not text:
+        return ""
+    label_match = re.search(
+        r"(?i)(?:merchant\s*name|company\s*name|customer\s*name|商户名称|公司名称|客户名称)[\s:：\-]+([^\n\r,;|]{2,80})",
+        text,
+    )
+    if label_match:
+        name = label_match.group(1).strip()
+        if name and name.lower() not in ("n/a", "na", "none", "未填写"):
+            return name[:80]
+    company_match = re.search(
+        r"([^\n\r,;|]{2,60}(?:有限公司|有限責任公司|Limited|Ltd\.?|Co\.?\s*,?\s*Ltd\.?|Inc\.?|Corporation|Group))",
+        text,
+        re.IGNORECASE,
+    )
+    if company_match:
+        return company_match.group(1).strip()[:80]
+    return ""
+
+def infer_amount_currency_from_text(text):
+    if not text:
+        return 0.0, "USD"
+    currency_codes = "|".join(re.escape(c) for c in CURRENCY_OPTIONS)
+    patterns = [
+        rf"(?i)({currency_codes})\s*[\$]?\s*([\d,]+(?:\.\d+)?)",
+        rf"(?i)[\$€£]\s*([\d,]+(?:\.\d+)?)\s*({currency_codes})?",
+        rf"(?i)([\d,]+(?:\.\d+)?)\s*({currency_codes})",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if not match:
+            continue
+        groups = [g for g in match.groups() if g]
+        if len(groups) == 2:
+            if groups[0].upper() in CURRENCY_OPTIONS:
+                currency = groups[0].upper()
+                amount_text = groups[1]
+            elif groups[1].upper() in CURRENCY_OPTIONS:
+                currency = groups[1].upper()
+                amount_text = groups[0]
+            else:
+                continue
+        else:
+            amount_text = groups[0]
+            currency = "USD"
+        amount = clean_import_amount(amount_text)
+        if amount > 0:
+            return amount, currency
+    return 0.0, "USD"
+
+def infer_biz_line_from_text(text):
+    if not text:
+        return "电商"
+    lower = text.lower()
+    if any(k in lower for k in ("b2b", "wholesale", "trade finance")):
+        return "B2B"
+    if any(k in lower for k in ("服贸", "汇兑", "fx", "foreign exchange")):
+        return "服贸汇兑"
+    return "电商"
+
+def infer_registration_from_email(item):
+    subject = clean_import_str(item.get("邮件标题"))
+    body = clean_import_str(item.get("邮件内容"))
+    from_addr = clean_import_str(item.get("发件人"))
+    combined = f"{subject}\n{body}"
+    amount, currency = infer_amount_currency_from_text(combined)
+    merchant_id = infer_merchant_id_from_text(combined)
+    merchant_name = infer_merchant_name_from_text(combined)
+    content_category = infer_content_category_from_text(subject, body)
+    detail_text = body[:2000] if body else ""
+    remitter = ""
+    beneficiary = ""
+    remitter_match = re.search(r"(?i)(?:remitter|payer|汇款方|付款方)[\s:：\-]+([^\n\r,;|]{2,80})", combined)
+    beneficiary_match = re.search(r"(?i)(?:beneficiary|payee|收款方)[\s:：\-]+([^\n\r,;|]{2,80})", combined)
+    if remitter_match:
+        remitter = remitter_match.group(1).strip()[:80]
+    if beneficiary_match:
+        beneficiary = beneficiary_match.group(1).strip()[:80]
+    receive_date = item.get("收件日期") or datetime.date.today().isoformat()
+    try:
+        receive_date_obj = pd.to_datetime(receive_date).date()
+    except Exception:
+        receive_date_obj = datetime.date.today()
+    return {
+        "message_id": item.get("message_id", ""),
+        "收件日期": receive_date_obj,
+        "商户ID": merchant_id,
+        "商户名称": merchant_name,
+        "调单类型": item.get("调单类型") or infer_order_type_from_subject(subject),
+        "金额": amount,
+        "币种": currency if currency in CURRENCY_OPTIONS else "USD",
+        "业务线": infer_biz_line_from_text(combined),
+        "渠道": item.get("渠道") or infer_channel_from_email(from_addr, subject),
+        "邮件标题": subject,
+        "调单内容分类": content_category if content_category in CONTENT_CATEGORIES else "",
+        "详细信息": detail_text,
+        "汇款方": remitter,
+        "收款方": beneficiary,
+    }
+
+def inbox_widget_key(message_id, prefix):
+    digest = hashlib.md5(clean_import_str(message_id).encode("utf-8")).hexdigest()[:16]
+    return f"{prefix}_{digest}"
+
+def get_email_inbox_items():
+    return st.session_state.setdefault("email_inbox_items", [])
+
+def collect_inbox_message_ids(items=None):
+    items = items if items is not None else get_email_inbox_items()
+    return {clean_import_str(item.get("message_id")) for item in items if clean_import_str(item.get("message_id"))}
+
+def build_email_inbox_item(msg, message_id):
+    subject = decode_mime_words(msg.get("Subject")) or "（无主题）"
+    from_raw = decode_mime_words(msg.get("From"))
+    _, from_addr = parseaddr(from_raw)
+    from_addr = clean_import_str(from_addr) or from_raw
+    receive_dt = parsedate_to_datetime(msg.get("Date")) if msg.get("Date") else datetime.datetime.now()
+    if isinstance(receive_dt, datetime.datetime):
+        receive_date = receive_dt.date().isoformat()
+    else:
+        receive_date = datetime.date.today().isoformat()
+    body_snippet = extract_email_text_body(msg, max_len=2000)
+    return {
+        "message_id": message_id,
+        "收件日期": receive_date,
+        "邮件标题": subject,
+        "邮件内容": body_snippet,
+        "发件人": from_addr,
+        "调单状态": "待处理",
+        "调单类型": infer_order_type_from_subject(subject),
+        "渠道": infer_channel_from_email(from_addr, subject),
+        "registered": False,
+        "同步时间": datetime.datetime.now().isoformat(),
+    }
+
+def merge_emails_into_inbox(new_items):
+    inbox = get_email_inbox_items()
+    existing_ids = collect_inbox_message_ids(inbox)
+    added = 0
+    for item in new_items:
+        message_id = clean_import_str(item.get("message_id"))
+        if not message_id or message_id in existing_ids:
+            continue
+        inbox.append(item)
+        existing_ids.add(message_id)
+        added += 1
+    st.session_state["email_inbox_items"] = inbox
+    return added
+
+def mark_inbox_email_registered(message_id):
+    message_id = clean_import_str(message_id)
+    if not message_id:
+        return
+    for item in get_email_inbox_items():
+        if clean_import_str(item.get("message_id")) == message_id:
+            item["registered"] = True
+            item["调单状态"] = "已结案"
+            break
+
+def apply_pending_reg_email_fill():
+    pending = st.session_state.pop("_reg_pending_email_fill", None)
+    if not pending:
+        return
+    st.session_state["reg_selected_message_id"] = pending.get("message_id", "")
+    st.session_state["reg_receive_date"] = pending.get("收件日期", datetime.date.today())
+    st.session_state["reg_merchant_id"] = pending.get("商户ID", "")
+    st.session_state["reg_merchant_name"] = pending.get("商户名称", "")
+    st.session_state["reg_order_type"] = pending.get("调单类型", STAT_TYPE_OPTIONS[0])
+    st.session_state["reg_amount"] = float(pending.get("金额", 0) or 0)
+    currency = pending.get("币种", "USD")
+    st.session_state["reg_currency"] = currency if currency in CURRENCY_OPTIONS else "USD"
+    biz_line = pending.get("业务线", "电商")
+    st.session_state["reg_biz_line"] = biz_line if biz_line in ["电商", "B2B", "服贸汇兑"] else "电商"
+    st.session_state["reg_channel"] = pending.get("渠道", "")
+    st.session_state["reg_email_title"] = pending.get("邮件标题", "")
+    category = pending.get("调单内容分类", "")
+    st.session_state["reg_content_category"] = category if category in CONTENT_CATEGORIES else ""
+    st.session_state["reg_detail_text"] = pending.get("详细信息", "")
+    st.session_state["reg_remitter"] = pending.get("汇款方", "")
+    st.session_state["reg_beneficiary"] = pending.get("收款方", "")
+    st.session_state.setdefault("reg_handler", HANDLER_OPTIONS[0])
+    st.session_state.setdefault("reg_sales", SALES_OPTIONS[0])
+    st.session_state.setdefault("reg_due_date", datetime.date.today())
+    st.session_state.setdefault("reg_va", "")
+
+def _queue_reg_email_fill(message_id):
+    inbox = get_email_inbox_items()
+    target = None
+    for item in inbox:
+        if clean_import_str(item.get("message_id")) == clean_import_str(message_id):
+            target = item
+            break
+    if not target:
+        return
+    st.session_state["_reg_pending_email_fill"] = infer_registration_from_email(target)
+
 def build_email_diaodan_record(msg, message_id):
     subject = decode_mime_words(msg.get("Subject")) or "（无主题）"
     from_raw = decode_mime_words(msg.get("From"))
@@ -937,18 +1188,8 @@ def sync_emails_from_imap(config=None):
     keyword = clean_import_str(config.get("keyword")).lower()
     existing_df = load_all_data()
     existing_message_ids = collect_existing_email_message_ids(existing_df)
-    existing_title_keys = set()
-    if len(existing_df) > 0:
-        for _, row in existing_df.iterrows():
-            existing_title_keys.add(import_dedup_key({
-                "邮件标题": clean_import_str(row.get("邮件标题")),
-                "商户ID": clean_import_str(row.get("商户ID")) or "未填写",
-                "收件日期": clean_import_str(row.get("收件日期")),
-                "调单类型": clean_import_str(row.get("调单类型")),
-                "渠道": clean_import_str(row.get("渠道")),
-                "金额": row.get("金额", 0),
-            }))
-    new_count = 0
+    existing_message_ids |= collect_inbox_message_ids()
+    fetched_items = []
     skip_count = 0
     fail_count = 0
     errors = []
@@ -982,21 +1223,13 @@ def sync_emails_from_imap(config=None):
                 if keyword and keyword not in subject.lower():
                     skip_count += 1
                     continue
-                record = build_email_diaodan_record(msg, message_id)
-                title_key = import_dedup_key(record)
-                if title_key in existing_title_keys:
-                    skip_count += 1
-                    continue
-                db_record = to_db_record(record)
-                supabase.table("diaodan").insert(db_record).execute()
-                new_count += 1
+                fetched_items.append(build_email_inbox_item(msg, message_id))
                 existing_message_ids.add(message_id)
-                existing_title_keys.add(title_key)
             except Exception as exc:
                 fail_count += 1
                 if len(errors) < 3:
                     errors.append(str(exc))
-        st.cache_data.clear()
+        new_count = merge_emails_into_inbox(fetched_items)
         return {
             "ok": True,
             "error": None,
@@ -1628,6 +1861,18 @@ INTERNAL_RFI_TEMPLATES = {
 
 DEVELOPER_CHANGELOG = [
     {
+        "version": "v1.0.24",
+        "date": "2026-07-24",
+        "emoji": "📨",
+        "title": "邮箱拉取不入库 + 点邮件预填登记",
+        "tags": ["优化", "调单登记", "邮箱同步"],
+        "items": [
+            "同步邮箱仅拉取到本页待办，不再自动写入全部数据",
+            "点击「填入登记」自动预填右侧表单（商户、金额、渠道等），可修改后提交",
+            "确认提交后才写入数据库",
+        ],
+    },
+    {
         "version": "v1.0.23",
         "date": "2026-07-24",
         "emoji": "📋",
@@ -2136,7 +2381,7 @@ def render_developer_log_page():
 def render_email_status_panel():
     email_cfg = get_email_sync_config()
     with st.expander("⚙️ 邮箱同步配置", expanded=False):
-        st.caption("Streamlit 无法 24h 后台监听邮箱；打开本页或点按钮同步。")
+        st.caption("邮件仅拉取到本页待办，不会自动写入全部数据；登记后才会入库。")
         st.markdown("""
 ```toml
 [email_sync]
@@ -2174,73 +2419,114 @@ auto_sync_on_open = true
     if last_sync:
         if last_sync.get("ok"):
             st.success(
-                f"新增 {last_sync.get('new_count', 0)} · 跳过 {last_sync.get('skip_count', 0)} · 失败 {last_sync.get('fail_count', 0)}"
+                f"拉取 {last_sync.get('new_count', 0)} 封 · 跳过 {last_sync.get('skip_count', 0)} · 失败 {last_sync.get('fail_count', 0)}"
             )
         else:
             st.error(f"同步失败：{last_sync.get('error')}")
 
-    df = load_all_data()
-    email_df = filter_email_inbox_df(df)
-    status_counts = email_df["调单状态"].value_counts() if len(email_df) > 0 else pd.Series(dtype=int)
+    inbox_items = get_email_inbox_items()
+    pending_items = [item for item in inbox_items if not item.get("registered")]
+    status_counts = pd.Series([item.get("调单状态", "待处理") for item in pending_items]).value_counts()
     mc1, mc2, mc3, mc4 = st.columns(4)
     for col, status in zip([mc1, mc2, mc3, mc4], DIAODAN_STATUS_OPTIONS):
         with col:
             st.metric(status, f"{int(status_counts.get(status, 0)):,}", label_visibility="collapsed")
 
     st.markdown("**📋 待处理邮箱**")
-    st.caption("仅邮箱同步记录")
+    st.caption("点击「填入登记」可将邮件预填到右侧表单，确认后再提交入库")
 
-    if len(email_df) == 0:
-        st.info("暂无邮箱调单，点「同步邮箱」拉取。")
+    if len(pending_items) == 0:
+        st.info("暂无待处理邮件。点「同步邮箱」拉取，或直接在右侧手工登记。")
         return
 
     filter_status = st.selectbox("筛选", ["全部"] + DIAODAN_STATUS_OPTIONS, key="status_page_filter")
-    filtered = email_df.copy()
+    filtered = pending_items
     if filter_status != "全部":
-        filtered = filtered[filtered["调单状态"] == filter_status]
+        filtered = [item for item in pending_items if item.get("调单状态") == filter_status]
 
-    show_df = filtered[["id", "调单状态", "邮件标题", "邮件内容"]].sort_values("id", ascending=False).copy()
-    show_df["邮件标题"] = show_df["邮件标题"].fillna("").astype(str)
-    show_df["邮件内容"] = show_df["邮件内容"].fillna("").astype(str)
+    filtered = sorted(filtered, key=lambda x: x.get("同步时间", ""), reverse=True)
+    selected_message_id = clean_import_str(st.session_state.get("reg_selected_message_id"))
 
-    for _, row in show_df.iterrows():
+    for item in filtered:
+        message_id = clean_import_str(item.get("message_id"))
+        is_selected = message_id and message_id == selected_message_id
         with st.container(border=True):
-            head_col, status_col = st.columns([4, 1])
+            head_col, status_col = st.columns([3.2, 1.3])
             with head_col:
-                st.markdown(f"**{row['邮件标题']}**")
+                prefix = "✅ " if is_selected else ""
+                st.markdown(f"{prefix}**{item.get('邮件标题', '（无主题）')}**")
+                st.caption(f"{item.get('发件人', '')} · {item.get('收件日期', '')}")
             with status_col:
+                status_key = inbox_widget_key(message_id, "email_status")
+                current_status = item.get("调单状态", "待处理")
+                if status_key not in st.session_state:
+                    st.session_state[status_key] = current_status
                 st.selectbox(
                     "状态",
                     DIAODAN_STATUS_OPTIONS,
-                    index=DIAODAN_STATUS_OPTIONS.index(row["调单状态"]) if row["调单状态"] in DIAODAN_STATUS_OPTIONS else 0,
-                    key=f"email_status_{row['id']}",
+                    key=status_key,
                     label_visibility="collapsed",
                 )
             st.text_area(
                 "邮件内容",
-                value=row["邮件内容"],
-                height=120,
+                value=item.get("邮件内容", ""),
+                height=100,
                 disabled=True,
-                key=f"email_body_{row['id']}",
+                key=inbox_widget_key(message_id, "email_body"),
                 label_visibility="collapsed",
             )
+            fill_col1, fill_col2 = st.columns([1.2, 2])
+            with fill_col1:
+                st.button(
+                    "📝 填入登记",
+                    key=inbox_widget_key(message_id, "email_fill"),
+                    use_container_width=True,
+                    type="primary" if is_selected else "secondary",
+                    on_click=_queue_reg_email_fill,
+                    args=(message_id,),
+                )
+            with fill_col2:
+                st.caption("右侧可修改预填内容后再提交")
 
     if st.button("💾 保存状态", use_container_width=True, key="email_save_status_btn"):
         updated = 0
-        for _, row in show_df.iterrows():
-            rid = int(row["id"])
-            new_status = st.session_state.get(f"email_status_{rid}", row["调单状态"])
-            old_row = email_df[email_df["id"] == rid].iloc[0]
-            if new_status != get_diaodan_status_from_row(old_row):
-                if update_diaodan_status_by_id(rid, new_status, old_row.get("调单内容详情", "")):
-                    updated += 1
+        for item in pending_items:
+            message_id = clean_import_str(item.get("message_id"))
+            status_key = inbox_widget_key(message_id, "email_status")
+            new_status = st.session_state.get(status_key, item.get("调单状态", "待处理"))
+            if new_status in DIAODAN_STATUS_OPTIONS and new_status != item.get("调单状态"):
+                item["调单状态"] = new_status
+                updated += 1
         if updated > 0:
-            st.success(f"已更新 {updated} 条")
+            st.success(f"已更新 {updated} 条本地状态")
             st.rerun()
         else:
             st.info("无状态变更")
 
+def build_registration_detail_payload(内容详情, message_id="", email_meta=None):
+    detail = dict(内容详情 or {})
+    if email_meta:
+        detail.update(email_meta)
+    if message_id:
+        detail["邮件MessageId"] = message_id
+        detail.setdefault("同步来源", "邮箱IMAP")
+    return json.dumps(detail, ensure_ascii=False) if detail else ""
+
 def render_register_diaodan_panel():
+    apply_pending_reg_email_fill()
+    selected_message_id = clean_import_str(st.session_state.get("reg_selected_message_id"))
+    if selected_message_id:
+        selected_item = next(
+            (item for item in get_email_inbox_items() if clean_import_str(item.get("message_id")) == selected_message_id),
+            None,
+        )
+        if selected_item:
+            st.info(f"📨 已从邮件预填：**{selected_item.get('邮件标题', '')}** — 请核对并修改后提交")
+        else:
+            st.caption("当前关联邮件待重新选择")
+    else:
+        st.caption("可手工填写，或从左侧邮件点「填入登记」自动预填")
+
     调单内容分类 = st.selectbox(
         "调单内容分类",
         CONTENT_CATEGORIES,
@@ -2252,14 +2538,18 @@ def render_register_diaodan_panel():
     col1, col2 = st.columns(2)
     with col1:
         收件日期 = st.date_input("收件日期", datetime.date.today(), key="reg_receive_date")
+        截止日期 = st.date_input("截止日期", datetime.date.today(), key="reg_due_date")
         商户ID = st.text_input("商户ID *", placeholder="如：5181241025033620258", key="reg_merchant_id")
         商户名称 = st.text_input("商户名称 *", placeholder="如：宇信數碼有限公司", key="reg_merchant_name")
+        处理人 = st.selectbox("处理人", HANDLER_OPTIONS, key="reg_handler")
         调单类型 = st.selectbox("（统计用）调单类型", STAT_TYPE_OPTIONS, key="reg_order_type")
     with col2:
         金额 = st.number_input("金额", min_value=0.0, step=0.01, value=0.0, key="reg_amount")
         币种 = st.selectbox("币种", CURRENCY_OPTIONS, index=CURRENCY_OPTIONS.index("USD"), key="reg_currency")
         业务线 = st.selectbox("业务线", ["电商", "B2B", "服贸汇兑"], key="reg_biz_line")
         渠道 = st.text_input("渠道", placeholder="如：Banking Circle / DBS / SCB", key="reg_channel")
+        所属销售 = st.selectbox("所属销售", SALES_OPTIONS, key="reg_sales")
+        VA = st.text_input("VA（选填）", placeholder="可选", key="reg_va")
     邮件标题 = st.text_input("邮件标题（可选）", placeholder="调单邮件主题", key="reg_email_title")
     内容详情 = {}
     if 调单内容分类:
@@ -2282,19 +2572,49 @@ def render_register_diaodan_panel():
                 if len(history_df) > 0:
                     st.warning(f"⚠️ 历史调单 **{len(history_df)}** 条")
                     st.dataframe(history_df, use_container_width=True, hide_index=True)
+        elif 调单内容分类 == "Recall":
+            recall_col1, recall_col2 = st.columns(2)
+            with recall_col1:
+                Recall类型 = st.selectbox("Recall类型", RECALL_TYPE_OPTIONS, key="reg_recall_type")
+            with recall_col2:
+                渠道流水号 = st.text_input("渠道流水号（选填）", key="reg_channel_tx_id")
+            汇款人 = st.text_input("汇款人（选填）", key="reg_recall_remitter")
+            内容详情 = {"Recall类型": Recall类型, "渠道流水号": 渠道流水号, "汇款人": 汇款人}
         else:
             内容详情["详细信息"] = st.text_area("详细信息", placeholder="请填写详情", key="reg_detail_text")
     if st.button("✅ 提交调单", type="primary", key="reg_submit_btn", use_container_width=True):
         if not 商户ID or not 商户名称:
             st.error("商户ID和商户名称不能为空")
         else:
-            调单内容详情 = json.dumps(内容详情, ensure_ascii=False) if 内容详情 else ""
+            email_meta = {}
+            linked_item = None
+            if selected_message_id:
+                linked_item = next(
+                    (item for item in get_email_inbox_items() if clean_import_str(item.get("message_id")) == selected_message_id),
+                    None,
+                )
+                if linked_item:
+                    status_key = inbox_widget_key(selected_message_id, "email_status")
+                    email_meta = {
+                        "调单状态": st.session_state.get(status_key, linked_item.get("调单状态", "待处理")),
+                        "发件人": linked_item.get("发件人", ""),
+                        "邮件摘要": linked_item.get("邮件内容", ""),
+                        "同步时间": linked_item.get("同步时间", datetime.datetime.now().isoformat()),
+                    }
+            if not 内容详情 and st.session_state.get("reg_detail_text"):
+                内容详情 = {"详细信息": st.session_state.get("reg_detail_text", "")}
+            调单内容详情 = build_registration_detail_payload(内容详情, selected_message_id, email_meta)
             if save_data(
                 str(收件日期), 商户ID.strip(), 商户名称.strip(), 调单类型, 金额, 币种,
                 业务线, 渠道.strip(), 邮件标题.strip(), 调单内容分类, 调单内容详情,
+                处理人, 所属销售, str(截止日期), VA.strip(),
             ):
-                st.success("✅ 登记成功")
+                if selected_message_id:
+                    mark_inbox_email_registered(selected_message_id)
+                st.session_state.pop("reg_selected_message_id", None)
+                st.success("✅ 登记成功，已写入全部数据")
                 st.balloons()
+                st.rerun()
 
 def render_register_and_process_page():
     st.header("📋 调单登记与处理")
@@ -2307,23 +2627,31 @@ def render_register_and_process_page():
         align-items: flex-start;
         gap: 0.75rem;
     }
-    #reg-process-split + div[data-testid="stHorizontalBlock"] > div[data-testid="column"]:first-child,
-    #reg-process-split + div[data-testid="stHorizontalBlock"] > div[data-testid="column"]:last-child {
-        max-height: calc(100vh - 11rem);
-        overflow-y: auto;
-        overflow-x: hidden;
+    #reg-process-split + div[data-testid="stHorizontalBlock"] > div[data-testid="column"]:first-child {
         padding: 0.25rem 0.6rem 1rem;
         border-radius: 12px;
         border: 1px solid #ececec;
         background: #fafafa;
     }
     #reg-process-split + div[data-testid="stHorizontalBlock"] > div[data-testid="column"]:last-child {
+        position: sticky;
+        top: 4.5rem;
+        align-self: flex-start;
+        max-height: calc(100vh - 5.5rem);
+        overflow-y: auto;
+        overflow-x: hidden;
+        overscroll-behavior: contain;
+        padding: 0.25rem 0.6rem 1rem;
+        border-radius: 12px;
+        border: 1px solid #e0e0e0;
         background: #ffffff;
+        box-shadow: 0 2px 8px rgba(0, 0, 0, 0.06);
+        z-index: 1;
     }
-    #reg-process-split + div[data-testid="stHorizontalBlock"] > div[data-testid="column"]::-webkit-scrollbar {
+    #reg-process-split + div[data-testid="stHorizontalBlock"] > div[data-testid="column"]:last-child::-webkit-scrollbar {
         width: 8px;
     }
-    #reg-process-split + div[data-testid="stHorizontalBlock"] > div[data-testid="column"]::-webkit-scrollbar-thumb {
+    #reg-process-split + div[data-testid="stHorizontalBlock"] > div[data-testid="column"]:last-child::-webkit-scrollbar-thumb {
         background: #d4d4d4;
         border-radius: 4px;
     }
@@ -2904,7 +3232,6 @@ elif page == "📨 对客RFI":
                 category_options.append(f"{cat} - {item}")
         selected_option = st.selectbox("选择调单场景", category_options)
         selected_template = selected_option.split(" - ")[-1] if " - " in selected_option else selected_option
-        rfi_type = st.selectbox("调单类型", STAT_TYPE_OPTIONS, key="rfi_type")
         if selected_template in INTERNAL_RFI_TEMPLATES:
             with st.expander("📄 查看模板预览"):
                 st.text(INTERNAL_RFI_TEMPLATES[selected_template])
@@ -2917,7 +3244,7 @@ elif page == "📨 对客RFI":
             st.session_state["rfi_mail_to"] = email_defaults["to"]
         if "rfi_mail_cc" not in st.session_state:
             st.session_state["rfi_mail_cc"] = email_defaults["cc"]
-        default_subject = f"【RFI】{selected_template} - {rfi_type}"
+        default_subject = f"【RFI】{selected_template}"
 
         st.markdown("""
         <style>
@@ -2980,7 +3307,7 @@ elif page == "📨 对客RFI":
             mailto_url, body_truncated = build_mailto_url_safe(
                 mail_to, mail_cc, mail_subject, edited_content
             )
-            tool_col1, tool_col2, tool_col3, tool_col4, tool_col5, tool_col6 = st.columns([1.4, 1.2, 1, 1, 1, 0.8])
+            tool_col1, tool_col2, tool_col3, tool_col4, tool_col5 = st.columns([1.4, 1.2, 1, 1, 0.8])
             with tool_col1:
                 st.link_button("📧 打开邮件客户端", mailto_url, type="primary", use_container_width=True)
             with tool_col2:
@@ -2989,14 +3316,10 @@ elif page == "📨 对客RFI":
                 if st.button("📋 复制正文", use_container_width=True):
                     st.session_state["rfi_copy_hint"] = edited_content
             with tool_col4:
-                if st.button("📧 插入类型", use_container_width=True):
-                    st.session_state["rfi_draft"] = edited_content + f"\n\n调单类型：{rfi_type}"
-                    st.rerun()
-            with tool_col5:
                 if st.button("💾 存草稿", use_container_width=True):
                     st.session_state["rfi_draft_saved"] = edited_content
                     st.success("已保存")
-            with tool_col6:
+            with tool_col5:
                 if st.button("🔄 重置", use_container_width=True):
                     st.rerun()
 
