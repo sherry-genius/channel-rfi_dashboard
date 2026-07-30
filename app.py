@@ -1,4 +1,5 @@
 import streamlit as st
+import streamlit.components.v1 as components
 import pandas as pd
 import datetime
 import json
@@ -1880,6 +1881,82 @@ def build_mailto_url_safe(to="", cc="", subject="", body="", max_body_len=1800):
         return build_mailto_url(to, cc, subject, body_value), False
     return build_mailto_url(to, cc, subject, ""), True
 
+
+def build_eml_draft(to="", cc="", subject="", body=""):
+    headers = []
+    to_value = normalize_email_list(to)
+    cc_value = normalize_email_list(cc)
+    subject_value = clean_import_str(subject)
+    if to_value:
+        headers.append(f"To: {to_value}")
+    if cc_value:
+        headers.append(f"Cc: {cc_value}")
+    if subject_value:
+        headers.append(f"Subject: {subject_value}")
+    headers.extend([
+        "MIME-Version: 1.0",
+        "Content-Type: text/plain; charset=utf-8",
+        "Content-Transfer-Encoding: 8bit",
+        "",
+    ])
+    return "\r\n".join(headers) + (body or "")
+
+
+def render_mailto_open_button(label, mailto_url, *, disabled=False, use_container_width=False, key=None):
+    """Open default mail client via JS in top window (Chrome blocks mailto in new tabs/iframes)."""
+    if disabled:
+        st.button(label, disabled=True, use_container_width=use_container_width, key=key)
+        return
+
+    url_json = json.dumps(mailto_url)
+    label_json = json.dumps(label)
+    btn_id = f"mailto-btn-{hashlib.md5(mailto_url.encode('utf-8')).hexdigest()[:10]}"
+    width_css = "width:100%;" if use_container_width else "width:auto;"
+    components.html(
+        f"""
+        <button id="{btn_id}" type="button" style="{width_css}box-sizing:border-box;padding:0.45rem 1rem;
+        background-color:#ff4b4b;color:#ffffff;border:none;border-radius:0.5rem;font-weight:600;
+        font-size:0.95rem;cursor:pointer;line-height:1.4;">
+        </button>
+        <script>
+        (function() {{
+            var btn = document.getElementById({json.dumps(btn_id)});
+            btn.textContent = {label_json};
+            btn.addEventListener("click", function() {{
+                var url = {url_json};
+                var opened = false;
+                var targets = [window.top, window.parent, window];
+                for (var i = 0; i < targets.length; i++) {{
+                    var targetWin = targets[i];
+                    if (!targetWin) continue;
+                    try {{
+                        var doc = targetWin.document;
+                        var link = doc.createElement("a");
+                        link.href = url;
+                        link.style.display = "none";
+                        doc.body.appendChild(link);
+                        link.click();
+                        doc.body.removeChild(link);
+                        opened = true;
+                        break;
+                    }} catch (err) {{
+                        try {{
+                            targetWin.location.href = url;
+                            opened = true;
+                            break;
+                        }} catch (err2) {{}}
+                    }}
+                }}
+                if (!opened) {{
+                    window.open(url, "_self");
+                }}
+            }});
+        }})();
+        </script>
+        """,
+        height=46,
+    )
+
 # ========== 模板数据 ==========
 CHANNEL_TEMPLATES = {
     "DBS": {
@@ -3549,27 +3626,51 @@ elif page == "📨 对客RFI":
             mailto_url, body_truncated = build_mailto_url_safe(
                 mail_to, mail_cc, mail_subject, edited_content
             )
-            tool_col1, tool_col2, tool_col3, tool_col4, tool_col5 = st.columns([1.4, 1.2, 1, 1, 0.8])
+            eml_draft = build_eml_draft(mail_to, mail_cc, mail_subject, edited_content)
+            has_recipient = bool(normalize_email_list(mail_to))
+            tool_col1, tool_col2, tool_col3, tool_col4, tool_col5, tool_col6 = st.columns(
+                [1.4, 1.2, 1.1, 1, 0.9, 0.8]
+            )
             with tool_col1:
-                st.link_button("📧 打开邮件客户端", mailto_url, type="primary", use_container_width=True)
+                render_mailto_open_button(
+                    "📧 打开邮件客户端",
+                    mailto_url,
+                    disabled=not has_recipient,
+                    use_container_width=True,
+                    key="rfi_open_mail_client",
+                )
             with tool_col2:
-                st.link_button("🌐 网易网页邮箱", email_defaults["webmail_url"], use_container_width=True)
+                st.download_button(
+                    "📥 下载.eml",
+                    data=eml_draft.encode("utf-8"),
+                    file_name="rfi_draft.eml",
+                    mime="message/rfc822",
+                    disabled=not has_recipient,
+                    use_container_width=True,
+                    help="Chrome 若未唤起客户端，下载后双击即可用默认邮件程序打开",
+                )
             with tool_col3:
+                st.link_button("🌐 网易网页邮箱", email_defaults["webmail_url"], use_container_width=True)
+            with tool_col4:
                 if st.button("📋 复制正文", use_container_width=True):
                     st.session_state["rfi_copy_hint"] = edited_content
-            with tool_col4:
+            with tool_col5:
                 if st.button("💾 存草稿", use_container_width=True):
                     st.session_state["rfi_draft_saved"] = edited_content
                     st.success("已保存")
-            with tool_col5:
+            with tool_col6:
                 if st.button("🔄 重置", use_container_width=True):
                     st.rerun()
 
         if body_truncated:
             st.warning("正文较长，mailto 仅填入收件人/抄送/主题，正文请点「复制正文」后粘贴。")
         if not normalize_email_list(mail_to):
-            st.info("💡 请先填写收件人。")
-        st.caption("将网易邮箱大师设为 Windows 默认邮件程序后，「打开邮件客户端」可自动填入各字段。")
+            st.info("💡 请先填写收件人，再点击「打开邮件客户端」或「下载.eml」。")
+        st.caption(
+            "Chrome 浏览器可能无法直接从网页唤起邮件客户端。"
+            "若「打开邮件客户端」无效，请点「下载.eml」后双击文件，"
+            "或在 Windows 设置默认邮件程序（网易邮箱大师 / Outlook）。"
+        )
         if st.session_state.get("rfi_copy_hint"):
             st.code(st.session_state["rfi_copy_hint"], language="text")
         if "rfi_draft_saved" in st.session_state:
