@@ -1,5 +1,4 @@
 import streamlit as st
-import streamlit.components.v1 as components
 import pandas as pd
 import datetime
 import json
@@ -1875,11 +1874,34 @@ def build_mailto_url(to="", cc="", subject="", body=""):
         return f"mailto:{to_value}?{query}" if query else f"mailto:{to_value}"
     return f"mailto:?{query}" if query else "mailto:"
 
-def build_mailto_url_safe(to="", cc="", subject="", body="", max_body_len=1800):
+def build_mailto_url_safe(to="", cc="", subject="", body="", max_url_len=2048):
+    """Keep mailto URL within browser/handler limits (long Chinese body breaks Chrome silently)."""
     body_value = body or ""
-    if len(body_value) <= max_body_len:
-        return build_mailto_url(to, cc, subject, body_value), False
-    return build_mailto_url(to, cc, subject, ""), True
+    if not body_value:
+        url = build_mailto_url(to, cc, subject, "")
+        return url, False
+
+    low, high = 0, len(body_value)
+    best_url = build_mailto_url(to, cc, subject, "")
+    truncated = True
+    while low <= high:
+        mid = (low + high) // 2
+        candidate = body_value[:mid]
+        url = build_mailto_url(to, cc, subject, candidate)
+        if len(url) <= max_url_len:
+            best_url = url
+            truncated = mid < len(body_value)
+            low = mid + 1
+        else:
+            high = mid - 1
+
+    if len(best_url) > max_url_len:
+        best_url = build_mailto_url(to, cc, "", "")
+        truncated = True
+    if len(best_url) > max_url_len:
+        best_url = build_mailto_url(to, "", "", "")
+        truncated = True
+    return best_url, truncated
 
 
 def build_eml_draft(to="", cc="", subject="", body=""):
@@ -1902,60 +1924,11 @@ def build_eml_draft(to="", cc="", subject="", body=""):
     return "\r\n".join(headers) + (body or "")
 
 
-def render_mailto_open_button(label, mailto_url, *, disabled=False, use_container_width=False, key=None):
-    """Open default mail client via JS in top window (Chrome blocks mailto in new tabs/iframes)."""
-    if disabled:
-        st.button(label, disabled=True, use_container_width=use_container_width, key=key)
-        return
-
-    url_json = json.dumps(mailto_url)
-    label_json = json.dumps(label)
-    btn_id = f"mailto-btn-{hashlib.md5(mailto_url.encode('utf-8')).hexdigest()[:10]}"
-    width_css = "width:100%;" if use_container_width else "width:auto;"
-    components.html(
-        f"""
-        <button id="{btn_id}" type="button" style="{width_css}box-sizing:border-box;padding:0.45rem 1rem;
-        background-color:#ff4b4b;color:#ffffff;border:none;border-radius:0.5rem;font-weight:600;
-        font-size:0.95rem;cursor:pointer;line-height:1.4;">
-        </button>
-        <script>
-        (function() {{
-            var btn = document.getElementById({json.dumps(btn_id)});
-            btn.textContent = {label_json};
-            btn.addEventListener("click", function() {{
-                var url = {url_json};
-                var opened = false;
-                var targets = [window.top, window.parent, window];
-                for (var i = 0; i < targets.length; i++) {{
-                    var targetWin = targets[i];
-                    if (!targetWin) continue;
-                    try {{
-                        var doc = targetWin.document;
-                        var link = doc.createElement("a");
-                        link.href = url;
-                        link.style.display = "none";
-                        doc.body.appendChild(link);
-                        link.click();
-                        doc.body.removeChild(link);
-                        opened = true;
-                        break;
-                    }} catch (err) {{
-                        try {{
-                            targetWin.location.href = url;
-                            opened = true;
-                            break;
-                        }} catch (err2) {{}}
-                    }}
-                }}
-                if (!opened) {{
-                    window.open(url, "_self");
-                }}
-            }});
-        }})();
-        </script>
-        """,
-        height=46,
-    )
+def render_mailto_open_button(label, mailto_url, *, use_container_width=False, key=None):
+    link_kwargs = {"type": "primary", "use_container_width": use_container_width}
+    if key:
+        link_kwargs["key"] = key
+    st.link_button(label, mailto_url, **link_kwargs)
 
 # ========== 模板数据 ==========
 CHANNEL_TEMPLATES = {
@@ -3627,7 +3600,6 @@ elif page == "📨 对客RFI":
                 mail_to, mail_cc, mail_subject, edited_content
             )
             eml_draft = build_eml_draft(mail_to, mail_cc, mail_subject, edited_content)
-            has_recipient = bool(normalize_email_list(mail_to))
             tool_col1, tool_col2, tool_col3, tool_col4, tool_col5, tool_col6 = st.columns(
                 [1.4, 1.2, 1.1, 1, 0.9, 0.8]
             )
@@ -3635,7 +3607,6 @@ elif page == "📨 对客RFI":
                 render_mailto_open_button(
                     "📧 打开邮件客户端",
                     mailto_url,
-                    disabled=not has_recipient,
                     use_container_width=True,
                     key="rfi_open_mail_client",
                 )
@@ -3645,9 +3616,8 @@ elif page == "📨 对客RFI":
                     data=eml_draft.encode("utf-8"),
                     file_name="rfi_draft.eml",
                     mime="message/rfc822",
-                    disabled=not has_recipient,
                     use_container_width=True,
-                    help="Chrome 若未唤起客户端，下载后双击即可用默认邮件程序打开",
+                    help="正文较长或按钮无效时，下载后双击用邮件客户端打开",
                 )
             with tool_col3:
                 st.link_button("🌐 网易网页邮箱", email_defaults["webmail_url"], use_container_width=True)
@@ -3663,14 +3633,21 @@ elif page == "📨 对客RFI":
                     st.rerun()
 
         if body_truncated:
-            st.warning("正文较长，mailto 仅填入收件人/抄送/主题，正文请点「复制正文」后粘贴。")
+            st.warning(
+                "正文较长，mailto 链接已自动缩短以兼容 Chrome / 网易邮箱大师。"
+                "完整正文请用「复制正文」粘贴，或点「下载.eml」。"
+            )
         if not normalize_email_list(mail_to):
-            st.info("💡 请先填写收件人，再点击「打开邮件客户端」或「下载.eml」。")
-        st.caption(
-            "Chrome 浏览器可能无法直接从网页唤起邮件客户端。"
-            "若「打开邮件客户端」无效，请点「下载.eml」后双击文件，"
-            "或在 Windows 设置默认邮件程序（网易邮箱大师 / Outlook）。"
-        )
+            st.info("💡 建议先填写收件人；也可直接打开客户端后再填写。")
+        with st.expander("🔧 邮件链接诊断（打不开时点这里）"):
+            st.caption(f"链接长度：**{len(mailto_url)}** 字符（Chrome 建议 ≤ 2048）")
+            st.code(mailto_url[:500] + ("..." if len(mailto_url) > 500 else ""), language="text")
+            st.markdown(
+                f'<a href="{html_lib.escape(mailto_url, quote=True)}" target="_self" '
+                f'style="color:#ff4b4b;font-weight:600;">备用：点此直接打开邮件客户端</a>',
+                unsafe_allow_html=True,
+            )
+        st.caption("若按钮无效，请用上方「备用链接」，或「下载.eml」后双击打开。")
         if st.session_state.get("rfi_copy_hint"):
             st.code(st.session_state["rfi_copy_hint"], language="text")
         if "rfi_draft_saved" in st.session_state:
