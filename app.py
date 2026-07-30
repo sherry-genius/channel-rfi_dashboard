@@ -1911,12 +1911,151 @@ CHANNEL_TEMPLATES = {
 }
 
 # ========== 对客RFI模板 ==========
-INTERNAL_RFI_TEMPLATES = {
-    "电商店铺材料": "- 请提供您/您代理商的在线商店链接\n- 请提供您/您代理商的商店的后台截图\n- 请提供从平台到您/您代理商的银行账户的提现记录",
-    "个人汇款方": "-请确认交易对手方为个人，个体工商户还是公司。\n--若交易对手方为个人代表公司交易，请提供该公司全名并解释为何使用个人账户做商业用途。",
-    "软件服务": "- 请提供交易对手方全名\n- 请说明业务关系，交易目的，以及涉及的产品或服务\n- 请提供交易相关证明文件",
-    "对内RFI通用": "【交易目的】\n请补充交易支持性材料\n-- 若涉及服务贸易，请提供双方合作协议\n-- 若涉及货物贸易，请补充提供采购合同和物流信息"
+RFI_SCENARIO_PARTS = {
+    "实时交易": {
+        "header": "Hi,\n\nA",
+        "footer": "A",
+    },
+    "已发生交易": {
+        "header": "Hi,\n\nB",
+        "footer": "B",
+    },
 }
+
+RFI_TEMPLATE_CATEGORIES = {
+    "📁 通用": ["交易目的", "交易目的（英文）"],
+    "📁 电商相关": ["电商店铺材料", "PayPal入账", "CNY order"],
+    "📁 交易对手相关": ["个人汇款方", "PSP入账", "交易目的-Bene mismatch"],
+    "📁 服务贸易": ["软件服务", "咨询服务", "广告服务"],
+}
+
+_RFI_MIDDLE_TEMPLATES_FALLBACK = {
+    "交易目的": (
+        "请补充以下材料：\n"
+        "1. 请说明业务关系，交易目的，以及涉及的产品或服务；\n"
+        "2. 若汇款方为支付机构，请提供实际汇款方的后台汇款记录截图；\n"
+        "3. 请提供交易相关证明文件\n"
+        "--- 若涉及货物交易，请提供合同，发票，货运证明（物流信息或报关单）\n"
+        "--- 若涉及服务交易（例如：投资、注资、贷款或咨询、网页或软件服务、广告服务等)，请提供相关服务(或代理)合同，发票，服务交付材料（广告平台后台截图/软件设计过程文件或测试文件等）\n"
+        "--- 若涉及电商交易，请同时提供销售网站，订单截图（含物流信息）等"
+    ),
+    "电商店铺材料": (
+        "- 请提供您/您代理商的在线商店链接，如您有代理商，请同时提供代理协议\n"
+        "- 请提供您/您代理商的商店的后台截图，其中应显示用于从平台接收销售收入的银行账户信息，包括但不限于银行名称、分行名称、账号和您/您代理商的公司/商户名称\n"
+        "- 请提供从平台到您/您代理商的银行账户的提现记录，其中应包括您/您代理商的公司/商家名称\n"
+        "- 请提供从您/您代理商的银行账户到GEP账户的提款记录，其中应包括上述提到的您/您代理商的银行账户信息，以及该乐天银行账户近1到2个月内的完整账单"
+    ),
+    "个人汇款方": (
+        "-请确认交易对手方为个人，个体工商户还是公司。\n"
+        "--- 若交易对手方为个人代表公司交易，请提供该公司全名并解释为何使用个人账户做商业用途。\n"
+        "--- 若交易对手方为个人交易，请解释他/她如何与其商业伙伴建立合作关系"
+    ),
+    "软件服务": (
+        "- 请提供交易对手方全名\n"
+        "- 请说明业务关系，交易目的，以及涉及的产品或服务\n"
+        "- 请提供交易相关证明文件\n"
+        "--- 若涉及服务交易（例如：投资、注资、贷款或咨询、网页或软件服务、广告服务等)，请提供: 相关服务(或代理)合同以及发票\n"
+        "— 若涉及网页或软件服务，请提供过程文件或测试文件，URL等"
+    ),
+    "咨询服务": (
+        "- 请提供交易对手方全名\n"
+        "- 请说明业务关系，交易目的，以及涉及的产品或服务\n"
+        "- 请提供交易相关证明文件\n"
+        "--- 若涉及服务交易（例如：投资、注资、贷款或咨询、网页或软件服务、广告服务等)，请提供: <相关服务(或代理)合同以及发票\n"
+        "— 若涉及咨询服务，请提供具体服务内容及相关服务介绍材料或交付物样本"
+    ),
+    "广告服务": (
+        "- 请提供交易对手方全名\n"
+        "- 请说明业务关系，交易目的，以及涉及的产品或服务\n"
+        "- 请提供交易相关证明文件\n"
+        "--- 若涉及服务交易（例如：投资、注资、贷款或咨询、网页或软件服务、广告服务等)，请提供: 相关服务(或代理)合同以及发票，同时请提供的广告服务业务支持文件，例如，广告收费标准或广告账户充值截图（截图应该能体现客户和交易方的名字）"
+    ),
+    "PayPal入账": (
+        "- 店铺网站\n"
+        "- PayPal提现记录(有账户持有人的名字)\n"
+        "- 请解释您和打款人之间的关系并提供符合商业情理的相关服务(或代理)合同/ 代运营协议(签署日期须在打款日期之前且甲乙双方的权责须符合业务关系)"
+    ),
+    "交易目的-Bene mismatch": (
+        "- 请说明交易目的，以及涉及的产品或服务\n"
+        "- 请说明付款方，收款方和您的三方关系\n"
+        "- 请提供交易相关证明材料\n"
+        "--- 若涉及货物交易，请提供合同，发票，货运证明（物流信息或报关单）\n"
+        "--- 若涉及电商交易，请同时提供销售网站\n"
+        "--- 若涉及服务贸易，请同时提供服务协议或代理协议。"
+    ),
+    "CNY order": (
+        "- 请提供商品页面的截图或商品链接\n"
+        "- 请提供包含全部金额的完整客户订单截图\n"
+        "– 请提供货运单号及货运跟踪信息截图"
+    ),
+    "PSP入账": (
+        "- 请确认实际付款方的全名\n"
+        "--- 若实际付款方与您的Airwallex账户名相同，请提供汇款账户近3个月的对账单\n"
+        "--- 若为第三方汇款，请提供交易水单、涉及的产品或服务以及相关证明，例如：合同及发票"
+    ),
+    "交易目的（英文）": (
+        "- 请提供交易对手方全名。如有，请提供对方的网站\n"
+        "- Please explain the nature of the business relationship, the purpose and the goods or services associated with the transaction. [请说明业务关系，交易目的，以及涉及的产品或服务] \n"
+        "- Please provide supporting documents for the transaction (e.g contract and invoice). [请提供交易相关证明文件。] \n"
+        "--- If you are trading in goods, please provide the related contract, invoice or documentation of shipment (e.g., shipping details,customs declaration). \n"
+        "*If the shipment documents cannot be provided because the trade has not been completed, the documents of the previously completed trade with the same counterparty can be provided as a reference. [若涉及货物交易，请提供相关合同、发票以及货运证明，（例如：物流信息或报关单）。若因贸易未完成而无法提供货运证明，可以提供过往与该交易对手方已完成的贸易材料作为参考] \n"
+        "--- If you are trading in services (e.g., consultation, web development, marketing services etc.), please provide the related service (or agency) agreement (e.g. document, messaging conversation, email) and invoice. [若涉及服务交易（例如：咨询, 网站设计，市场营销服务等)，请提供相关服务(或代理)合同以及发票]"
+    ),
+}
+
+
+@st.cache_data(show_spinner=False)
+def load_rfi_middle_templates():
+    txt_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "对客RFI分类情况.txt")
+    if not os.path.isfile(txt_path):
+        return dict(_RFI_MIDDLE_TEMPLATES_FALLBACK)
+
+    with open(txt_path, "r", encoding="utf-8") as f:
+        content = f.read()
+
+    if "【模板】" in content:
+        content = content.split("【模板】", 1)[0]
+
+    templates = {}
+    trade_purpose_count = 0
+    sections = re.split(r"(?=^【[^】]+】\s*$)", content, flags=re.MULTILINE)
+    for section in sections:
+        section = section.strip()
+        if not section:
+            continue
+        match = re.match(r"^【(?:情况：(.+)|([^】]+))】\s*\n?(.*)", section, re.DOTALL)
+        if not match:
+            continue
+        raw_name = (match.group(1) or match.group(2)).strip()
+        body = match.group(3).strip()
+        if raw_name == "交易目的":
+            trade_purpose_count += 1
+            name = "交易目的（英文）" if trade_purpose_count > 1 else "交易目的"
+        else:
+            name = raw_name
+        if body:
+            templates[name] = body
+
+    return templates or dict(_RFI_MIDDLE_TEMPLATES_FALLBACK)
+
+
+def compose_rfi_body(scenario, template_type, middle_templates):
+    parts = RFI_SCENARIO_PARTS.get(scenario, {"header": "", "footer": ""})
+    middle = middle_templates.get(template_type, "")
+    sections = [parts.get("header", ""), middle, parts.get("footer", "")]
+    return "\n\n".join(section for section in sections if section).strip()
+
+
+def build_rfi_template_options(middle_templates):
+    options = []
+    for category, items in RFI_TEMPLATE_CATEGORIES.items():
+        for item in items:
+            if item in middle_templates:
+                options.append(f"{category} - {item}")
+    for name in middle_templates:
+        if not any(name in items for items in RFI_TEMPLATE_CATEGORIES.values()):
+            options.append(f"📁 其他 - {name}")
+    return options
 
 DEVELOPER_CHANGELOG = [
     {
@@ -2761,7 +2900,7 @@ def render_register_and_process_page():
     </style>
     """, unsafe_allow_html=True)
     st.markdown('<span id="reg-process-split"></span>', unsafe_allow_html=True)
-    left_col, right_col = st.columns(2, gap="medium")
+    left_col, right_col = st.columns([1.5, 1], gap="medium")
     with left_col:
         st.markdown("### 📬 调单状态")
         render_email_status_panel()
@@ -3318,36 +3457,36 @@ elif page == "📧 回复渠道调单":
 # ============================================================
 elif page == "📨 对客RFI":
     st.header("📨 对客RFI（对内调单模板）")
-    st.caption("选择模板后，在右侧模拟邮箱界面填写并发送")
+    st.caption("选择调单场景与模板类型后，正文自动拼接为「开头 + 模板内容 + 结尾」")
     email_defaults = get_rfi_email_defaults()
+    rfi_middle_templates = load_rfi_middle_templates()
+    template_options = build_rfi_template_options(rfi_middle_templates)
     col1, col2 = st.columns([1, 2])
     with col1:
-        rfi_categories = {
-            "📁 电商相关": ["电商店铺材料", "PayPal入账", "CNY order", "电商Bene mismatch"],
-            "📁 交易对手相关": ["个人汇款方", "个人疑似命中制裁", "PSP入账", "交易目的-Bene mismatch"],
-            "📁 服务贸易": ["软件服务", "咨询服务", "广告服务"],
-            "📁 在途交易": ["单笔Pyvio incoming", "B2B单笔在途", "驰安汇单笔调单", "HIPAYX调单"],
-            "📁 风控调查": ["对内RFI通用", "警方协查", "结汇调单", "欺诈Recall"]
-        }
-        category_options = []
-        for cat, items in rfi_categories.items():
-            for item in items:
-                category_options.append(f"{cat} - {item}")
-        selected_option = st.selectbox("选择调单场景", category_options)
-        selected_template = selected_option.split(" - ")[-1] if " - " in selected_option else selected_option
-        if selected_template in INTERNAL_RFI_TEMPLATES:
-            with st.expander("📄 查看模板预览"):
-                st.text(INTERNAL_RFI_TEMPLATES[selected_template])
+        selected_scenario = st.selectbox("选择调单场景", ["实时交易", "已发生交易"])
+        selected_template_option = st.selectbox("模板类型", template_options)
+        selected_template_type = (
+            selected_template_option.split(" - ")[-1]
+            if " - " in selected_template_option
+            else selected_template_option
+        )
+        composed_preview = compose_rfi_body(
+            selected_scenario, selected_template_type, rfi_middle_templates
+        )
+        with st.expander("📄 查看正文预览"):
+            st.text(composed_preview)
+            st.caption("开头/结尾随「调单场景」变化，中间段随「模板类型」变化")
     with col2:
-        if selected_template in INTERNAL_RFI_TEMPLATES:
-            default_content = INTERNAL_RFI_TEMPLATES[selected_template]
-        else:
-            default_content = ""
+        default_content = compose_rfi_body(
+            selected_scenario, selected_template_type, rfi_middle_templates
+        )
         if "rfi_mail_to" not in st.session_state:
             st.session_state["rfi_mail_to"] = email_defaults["to"]
         if "rfi_mail_cc" not in st.session_state:
             st.session_state["rfi_mail_cc"] = email_defaults["cc"]
-        default_subject = f"【RFI】{selected_template}"
+        default_subject = f"【RFI】{selected_template_type}"
+        draft_key = f"rfi_draft_{selected_scenario}_{selected_template_type}"
+        subject_key = f"rfi_mail_subject_{selected_scenario}_{selected_template_type}"
 
         st.markdown("""
         <style>
@@ -3398,13 +3537,13 @@ elif page == "📨 对客RFI":
                 placeholder="可选，多个用逗号分隔",
                 key="rfi_mail_cc",
             )
-            mail_subject = st.text_input("主题", value=default_subject, key="rfi_mail_subject")
+            mail_subject = st.text_input("主题", value=default_subject, key=subject_key)
 
             edited_content = st.text_area(
                 "正文",
                 value=default_content,
                 height=360,
-                key="rfi_draft",
+                key=draft_key,
                 label_visibility="visible",
             )
             mailto_url, body_truncated = build_mailto_url_safe(
