@@ -2504,6 +2504,317 @@ def render_dev_guestbook_section():
         </div>
         """, unsafe_allow_html=True)
 
+# ========== 渠道政策 ==========
+CHANNEL_POLICY_XLSX = os.path.join(APP_DIR, "渠道政策汇总.xlsx")
+CHANNEL_POLICY_JSON = os.path.join(APP_DIR, "channel_policies.json")
+CHANNEL_POLICY_LOG_JSON = os.path.join(APP_DIR, "channel_policy_logs.json")
+
+def load_channel_policies_from_xlsx():
+    if not os.path.exists(CHANNEL_POLICY_XLSX):
+        return None
+    try:
+        with open(CHANNEL_POLICY_XLSX, "rb") as f:
+            file_bytes = f.read()
+        sheets = _xlsx_get_sheet_paths(file_bytes)
+        categories = {}
+        for sheet in sheets:
+            df = _xlsx_read_sheet_xml(file_bytes, sheet["name"])
+            df = df.fillna("")
+            columns = [str(c) for c in df.columns]
+            rows = []
+            for idx, row in df.iterrows():
+                row_dict = {
+                    col: clean_import_str(row[col]) if col in row.index else ""
+                    for col in columns
+                }
+                row_dict["_row_id"] = f"{sheet['name']}_{idx}"
+                rows.append(row_dict)
+            categories[sheet["name"]] = {"columns": columns, "rows": rows}
+        return {
+            "version": 1,
+            "source_file": os.path.basename(CHANNEL_POLICY_XLSX),
+            "imported_at": datetime.datetime.now().isoformat(timespec="seconds"),
+            "updated_at": datetime.datetime.now().isoformat(timespec="seconds"),
+            "categories": categories,
+        }
+    except Exception as exc:
+        st.error(f"读取 Excel 失败：{exc}")
+        return None
+
+def load_channel_policies_from_file():
+    if not os.path.exists(CHANNEL_POLICY_JSON):
+        return None
+    try:
+        with open(CHANNEL_POLICY_JSON, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict) and isinstance(data.get("categories"), dict):
+            return data
+    except Exception:
+        pass
+    return None
+
+def save_channel_policies_to_file(data):
+    try:
+        with open(CHANNEL_POLICY_JSON, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception:
+        return False
+
+def load_channel_policy_logs_from_file():
+    if not os.path.exists(CHANNEL_POLICY_LOG_JSON):
+        return []
+    try:
+        with open(CHANNEL_POLICY_LOG_JSON, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            return data
+    except Exception:
+        pass
+    return []
+
+def save_channel_policy_logs_to_file(entries):
+    try:
+        with open(CHANNEL_POLICY_LOG_JSON, "w", encoding="utf-8") as f:
+            json.dump(entries, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception:
+        return False
+
+def init_channel_policies():
+    if "channel_policies" not in st.session_state:
+        loaded = load_channel_policies_from_file()
+        if not loaded:
+            loaded = load_channel_policies_from_xlsx()
+            if loaded:
+                save_channel_policies_to_file(loaded)
+        st.session_state["channel_policies"] = loaded or {"categories": {}}
+
+def init_channel_policy_logs():
+    if "channel_policy_logs" not in st.session_state:
+        st.session_state["channel_policy_logs"] = load_channel_policy_logs_from_file()
+
+def _policy_row_label(row, columns):
+    preferred_keys = [
+        "渠道名称", "列1", "各渠道回复注意事项", "Flutterwave",
+        "TM Whitelisted Marketplace", "一、准入要求",
+    ]
+    for key in preferred_keys:
+        if key in row:
+            val = clean_import_str(row.get(key))
+            if val:
+                return val[:60]
+    for col in columns:
+        val = clean_import_str(row.get(col))
+        if val:
+            return f"{col}: {val[:40]}"
+    return "未命名行"
+
+def compare_policy_category(category, old_rows, new_rows, columns):
+    changes = []
+    old_by_id = {
+        clean_import_str(row.get("_row_id")): row
+        for row in old_rows
+        if clean_import_str(row.get("_row_id"))
+    }
+    merged_rows = []
+    seen_ids = set()
+
+    for idx, row in enumerate(new_rows):
+        row = dict(row)
+        row_id = clean_import_str(row.get("_row_id"))
+        if not row_id or row_id in seen_ids:
+            row_id = f"{category}_{datetime.datetime.now().strftime('%Y%m%d%H%M%S%f')}_{idx}"
+        row["_row_id"] = row_id
+        seen_ids.add(row_id)
+        for col in columns:
+            row.setdefault(col, "")
+            if col != "_row_id":
+                row[col] = clean_import_str(row.get(col))
+        merged_rows.append(row)
+
+        old_row = old_by_id.get(row_id)
+        if old_row is None:
+            changes.append({
+                "type": "新增",
+                "row_label": _policy_row_label(row, columns),
+                "fields": [{"field": "整行", "old": "", "new": "新增政策行"}],
+            })
+            continue
+
+        field_changes = []
+        all_cols = set(columns) | set(old_row.keys())
+        all_cols.discard("_row_id")
+        for col in all_cols:
+            old_val = clean_import_str(old_row.get(col))
+            new_val = clean_import_str(row.get(col))
+            if old_val != new_val:
+                field_changes.append({
+                    "field": col,
+                    "old": old_val[:300],
+                    "new": new_val[:300],
+                })
+        if field_changes:
+            changes.append({
+                "type": "修改",
+                "row_label": _policy_row_label(row, columns),
+                "fields": field_changes,
+            })
+
+    for row_id, old_row in old_by_id.items():
+        if row_id not in seen_ids:
+            changes.append({
+                "type": "删除",
+                "row_label": _policy_row_label(old_row, columns),
+                "fields": [{"field": "整行", "old": "已删除", "new": ""}],
+            })
+
+    return changes, merged_rows
+
+def append_channel_policy_log(category, changes):
+    if not changes:
+        return False, "无变更"
+    init_channel_policy_logs()
+    first = changes[0]
+    summary = f"{first.get('type')} · {first.get('row_label', '')}"
+    if len(changes) > 1:
+        summary += f" 等 {len(changes)} 项"
+    entry = {
+        "id": datetime.datetime.now().strftime("%Y%m%d%H%M%S%f"),
+        "time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "category": category,
+        "summary": summary,
+        "changes": changes,
+    }
+    st.session_state["channel_policy_logs"].insert(0, entry)
+    st.session_state["channel_policy_logs"] = st.session_state["channel_policy_logs"][:200]
+    save_channel_policy_logs_to_file(st.session_state["channel_policy_logs"])
+    return True, f"已保存 {len(changes)} 项变更"
+
+def render_channel_policy_page():
+    st.header("📜 渠道政策")
+    st.caption("按「渠道政策汇总.xlsx」分类汇总，可直接编辑并自动记录更新日志")
+    init_channel_policies()
+    init_channel_policy_logs()
+
+    data = st.session_state.get("channel_policies") or {"categories": {}}
+    categories = data.get("categories") or {}
+
+    if not categories:
+        st.warning("暂无渠道政策数据。请确认同目录下存在 `渠道政策汇总.xlsx`。")
+        if st.button("从 Excel 导入", type="primary", key="policy_initial_import"):
+            imported = load_channel_policies_from_xlsx()
+            if imported:
+                st.session_state["channel_policies"] = imported
+                save_channel_policies_to_file(imported)
+                append_channel_policy_log("系统", [{
+                    "type": "导入",
+                    "row_label": "渠道政策汇总.xlsx",
+                    "fields": [{"field": "来源", "old": "", "new": "首次从 Excel 导入"}],
+                }])
+                st.success("导入成功")
+                st.rerun()
+        return
+
+    col_main, col_log = st.columns([2.2, 1])
+    category_names = list(categories.keys())
+
+    with col_main:
+        top_col1, top_col2 = st.columns([2.2, 1])
+        with top_col1:
+            selected_category = st.selectbox("渠道分类", category_names, key="policy_category_select")
+        with top_col2:
+            if st.button("🔄 从 Excel 重新导入", use_container_width=True, key="policy_reimport_xlsx"):
+                imported = load_channel_policies_from_xlsx()
+                if imported:
+                    st.session_state["channel_policies"] = imported
+                    save_channel_policies_to_file(imported)
+                    append_channel_policy_log("系统", [{
+                        "type": "导入",
+                        "row_label": "渠道政策汇总.xlsx",
+                        "fields": [{"field": "操作", "old": "", "new": "从 Excel 全量重新导入"}],
+                    }])
+                    st.success("已从 Excel 重新导入")
+                    st.rerun()
+
+        cat_data = categories.get(selected_category, {})
+        columns = cat_data.get("columns", [])
+        rows = cat_data.get("rows", [])
+        display_cols = [c for c in columns if c != "_row_id"]
+
+        df = pd.DataFrame(rows)
+        for col in display_cols:
+            if col not in df.columns:
+                df[col] = ""
+        if "_row_id" not in df.columns:
+            df["_row_id"] = [f"{selected_category}_{i}" for i in range(len(df))]
+
+        editor_cols = display_cols + ["_row_id"]
+        st.caption(f"**{selected_category}** · 共 {len(df)} 行（可直接增删改，完成后点保存）")
+        edited_df = st.data_editor(
+            df[editor_cols] if editor_cols else df,
+            num_rows="dynamic",
+            use_container_width=True,
+            hide_index=True,
+            height=min(620, 100 + max(len(df), 3) * 36),
+            key=f"policy_editor_{selected_category}",
+            column_config={"_row_id": None},
+        )
+
+        save_col1, save_col2 = st.columns([1, 2])
+        with save_col1:
+            if st.button("💾 保存更新", type="primary", key=f"policy_save_{selected_category}"):
+                edited_rows = edited_df.fillna("").to_dict(orient="records")
+                changes, merged_rows = compare_policy_category(
+                    selected_category, rows, edited_rows, display_cols
+                )
+                if not changes:
+                    st.info("无变更")
+                else:
+                    data["categories"][selected_category]["rows"] = merged_rows
+                    data["updated_at"] = datetime.datetime.now().isoformat(timespec="seconds")
+                    st.session_state["channel_policies"] = data
+                    save_channel_policies_to_file(data)
+                    ok, msg = append_channel_policy_log(selected_category, changes)
+                    if ok:
+                        st.success(msg)
+                        st.rerun()
+                    else:
+                        st.warning(msg)
+        with save_col2:
+            updated_at = clean_import_str(data.get("updated_at") or data.get("imported_at"))
+            if updated_at:
+                st.caption(f"最近保存：{updated_at}")
+
+    with col_log:
+        st.subheader("📋 更新日志")
+        logs = st.session_state.get("channel_policy_logs", [])
+        if not logs:
+            st.caption("暂无更新记录。保存编辑后会在这里显示。")
+        for entry in logs[:40]:
+            with st.container(border=True):
+                st.markdown(f"**{entry.get('time', '')}**")
+                st.caption(entry.get("category", ""))
+                st.write(entry.get("summary", ""))
+                with st.expander("查看详情"):
+                    for change in entry.get("changes", []):
+                        st.markdown(f"- **{change.get('type', '')}** · {change.get('row_label', '')}")
+                        for field in change.get("fields", []):
+                            if not isinstance(field, dict):
+                                st.text(str(field))
+                                continue
+                            field_name = field.get("field", "")
+                            old_val = field.get("old", "")
+                            new_val = field.get("new", "")
+                            if field_name == "整行":
+                                st.text(f"{field_name}：{new_val or old_val}")
+                            else:
+                                st.text(f"{field_name}")
+                                if old_val:
+                                    st.caption(f"原：{old_val}")
+                                if new_val:
+                                    st.caption(f"新：{new_val}")
+
 def render_developer_log_page():
     st.markdown("""
     <style>
@@ -2961,7 +3272,7 @@ def render_register_and_process_page():
 # ========== 侧边栏导航 ==========
 page = st.sidebar.radio(
     "📌 功能导航",
-    ["📊 调单看板", "📋 调单登记与处理", "📤 导入历史数据", "📄 查看全部数据", "📧 回复渠道调单", "📨 对客RFI", "🐱 小陈的成长日记"]
+    ["📊 调单看板", "📋 调单登记与处理", "📤 导入历史数据", "📄 查看全部数据", "📧 回复渠道调单", "📨 对客RFI", "📜 渠道政策", "🐱 小陈的成长日记"]
 )
 
 # ============================================================
@@ -3654,7 +3965,13 @@ elif page == "📨 对客RFI":
             st.info("💡 已恢复之前保存的草稿")
 
 # ============================================================
-# PAGE 7: 小陈的成长日记
+# PAGE 7: 渠道政策
+# ============================================================
+elif page == "📜 渠道政策":
+    render_channel_policy_page()
+
+# ============================================================
+# PAGE 8: 小陈的成长日记
 # ============================================================
 elif page == "🐱 小陈的成长日记":
     render_developer_log_page()
